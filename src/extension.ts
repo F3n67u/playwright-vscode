@@ -17,21 +17,24 @@
 import path from 'path';
 import StackUtils from 'stack-utils';
 import { DebugHighlight } from './debugHighlight';
-import { installPlaywright } from './installer';
-import { Entry } from './oopReporter';
-import { PlaywrightTest, TestListener } from './playwrightTest';
-import { Recorder } from './recorder';
-import type { TestError } from './reporter';
-import { TestModel, TestProject } from './testModel';
-import { TestTree } from './testTree';
-import { ansiToHtml } from './utils';
+import { installBrowsers, installPlaywright } from './installer';
+import * as reporterTypes from './upstream/reporter';
+import { ReusedBrowser } from './reusedBrowser';
+import { SettingsModel } from './settingsModel';
+import { SettingsView } from './settingsView';
+import { TestModel, TestModelCollection } from './testModel';
+import { disabledProjectName as disabledProject, TestTree } from './testTree';
+import { NodeJSNotFoundError, getPlaywrightInfo, stripAnsi, stripBabelFrame, uriToPath } from './utils';
 import * as vscodeTypes from './vscodeTypes';
 import { WorkspaceChange, WorkspaceObserver } from './workspaceObserver';
+import { registerTerminalLinkProvider } from './terminalLinkProvider';
+import { RunHooks, TestConfig } from './playwrightTestTypes';
+import { ansi2html } from './ansi2html';
+import { LocatorsView } from './locatorsView';
 
 const stackUtils = new StackUtils({
   cwd: '/ensure_absolute_paths'
 });
-export type DebuggerLocation = { path: string, line: number, column: number };
 
 type StepInfo = {
   location: vscodeTypes.Location;
@@ -39,44 +42,48 @@ type StepInfo = {
   duration: number;
 };
 
-type TestRunInfo = {
-  selectedProjects: TestProject[];
-  isDebug: boolean;
-  request: vscodeTypes.TestRunRequest;
-};
-
 export async function activate(context: vscodeTypes.ExtensionContext) {
   // Do not await, quickly run the extension, schedule work.
-  new Extension(require('vscode')).activate(context);
+  new Extension(require('vscode'), context).activate();
 }
 
-export class Extension {
+export class Extension implements RunHooks {
   private _vscode: vscodeTypes.VSCode;
+  private _context: vscodeTypes.ExtensionContext;
+  private _disposables: vscodeTypes.Disposable[] = [];
 
   // Global test item map.
   private _testTree: TestTree;
-
-  // Each run profile is a config + project pair.
-  private _runProfiles = new Map<string, vscodeTypes.TestRunProfile>();
 
   private _testController: vscodeTypes.TestController;
   private _workspaceObserver: WorkspaceObserver;
   private _testItemUnderDebug: vscodeTypes.TestItem | undefined;
 
-  private _activeSteps = new Map<string, StepInfo>();
-  private _completedSteps = new Map<string, StepInfo>();
+  private _activeSteps = new Map<reporterTypes.TestStep, StepInfo>();
+  private _completedSteps = new Map<reporterTypes.TestStep, StepInfo>();
   private _testRun: vscodeTypes.TestRun | undefined;
-  private _models: TestModel[] = [];
+  private _models: TestModelCollection;
   private _activeStepDecorationType: vscodeTypes.TextEditorDecorationType;
   private _completedStepDecorationType: vscodeTypes.TextEditorDecorationType;
-  private _playwrightTest: PlaywrightTest;
-  private _projectsScheduledToRun: TestProject[] | undefined;
   private _debugHighlight: DebugHighlight;
   private _isUnderTest: boolean;
-  private _recorder: Recorder;
+  private _reusedBrowser: ReusedBrowser;
+  private _settingsModel: SettingsModel;
+  private _settingsView!: SettingsView;
+  private _locatorsView!: LocatorsView;
+  private _diagnostics: vscodeTypes.DiagnosticCollection;
+  private _treeItemObserver: TreeItemObserver;
+  private _runProfile: vscodeTypes.TestRunProfile;
+  private _debugProfile: vscodeTypes.TestRunProfile;
+  private _playwrightTestLog: string[] = [];
+  private _commandQueue = Promise.resolve();
+  private _watchFilesBatch?: vscodeTypes.TestItem[];
+  private _watchItemsBatch?: vscodeTypes.TestItem[];
+  overridePlaywrightVersion: number | null = null;
 
-  constructor(vscode: vscodeTypes.VSCode) {
+  constructor(vscode: vscodeTypes.VSCode, context: vscodeTypes.ExtensionContext) {
     this._vscode = vscode;
+    this._context = context;
     this._isUnderTest = !!(this._vscode as any).isUnderTest;
     this._activeStepDecorationType = this._vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
@@ -95,41 +102,123 @@ export class Extension {
       },
     });
 
-    this._playwrightTest = new PlaywrightTest(this._isUnderTest);
-    this._recorder = new Recorder(this._vscode, this._playwrightTest);
-    this._testController = vscode.tests.createTestController('pw.extension.testController', 'Playwright');
+    this._settingsModel = new SettingsModel(vscode, context);
+    this._reusedBrowser = new ReusedBrowser(this._vscode, this._settingsModel, this._envProvider.bind(this));
+    this._debugHighlight = new DebugHighlight(vscode, this._reusedBrowser);
+    this._models = new TestModelCollection(vscode, {
+      context,
+      playwrightTestLog: this._playwrightTestLog,
+      settingsModel: this._settingsModel,
+      runHooks: this,
+      isUnderTest: this._isUnderTest,
+      envProvider: this._envProvider.bind(this),
+      onStdOut: this._debugHighlight.onStdOut.bind(this._debugHighlight),
+      requestWatchRun: this._runWatchedTests.bind(this),
+    });
+    this._testController = vscode.tests.createTestController('playwright', 'Playwright');
     this._testController.resolveHandler = item => this._resolveChildren(item);
-    this._testTree = new TestTree(vscode, this._testController);
-    this._debugHighlight = new DebugHighlight(vscode);
+    this._testController.refreshHandler = () => this._rebuildModels(true).then(() => {});
+    const supportsContinuousRun = true;
+    this._runProfile = this._testController.createRunProfile('playwright-run', this._vscode.TestRunProfileKind.Run, this._handleTestRun.bind(this, false), true, undefined, supportsContinuousRun);
+    this._debugProfile = this._testController.createRunProfile('playwright-debug', this._vscode.TestRunProfileKind.Debug, this._handleTestRun.bind(this, true), true, undefined, supportsContinuousRun);
+    this._testTree = new TestTree(vscode, this._models, this._testController);
     this._debugHighlight.onErrorInDebugger(e => this._errorInDebugger(e.error, e.location));
     this._workspaceObserver = new WorkspaceObserver(this._vscode, changes => this._workspaceChanged(changes));
+    this._diagnostics = this._vscode.languages.createDiagnosticCollection('pw.testErrors.diagnostic');
+    this._treeItemObserver = new TreeItemObserver(this._vscode);
   }
 
-  async activate(context: vscodeTypes.ExtensionContext) {
+  async onWillRunTests(config: TestConfig, debug: boolean) {
+    await this._reusedBrowser.onWillRunTests(config, debug);
+    return {
+      connectWsEndpoint: this._reusedBrowser.browserServerWSEndpoint(),
+    };
+  }
+
+  async onDidRunTests(debug: boolean) {
+    await this._reusedBrowser.onDidRunTests(debug);
+  }
+
+  reusedBrowserForTest(): ReusedBrowser {
+    return this._reusedBrowser;
+  }
+
+  dispose() {
+    for (const d of this._disposables)
+      d?.dispose?.();
+  }
+
+  async activate() {
     const vscode = this._vscode;
-    const disposables = [
+    this._settingsView = new SettingsView(vscode, this._settingsModel, this._models, this._reusedBrowser, this._context.extensionUri);
+    this._locatorsView = new LocatorsView(vscode, this._reusedBrowser, this._context.extensionUri);
+    const messageNoPlaywrightTestsFound = this._vscode.l10n.t('No Playwright tests found.');
+    this._disposables = [
+      this._debugHighlight,
+      this._settingsModel,
       vscode.workspace.onDidChangeWorkspaceFolders(_ => {
-        this._rebuildModel(false);
+        this._rebuildModels(false);
       }),
       vscode.window.onDidChangeVisibleTextEditors(() => {
         this._updateVisibleEditorItems();
       }),
-      vscode.commands.registerCommand('pw.extension.refreshTests', async () => {
-        const configs = await this._rebuildModel(true);
-        if (!configs.length) {
-          vscode.window.showWarningMessage('No Playwright Test config files found.');
+      vscode.commands.registerCommand('pw.extension.install', async () => {
+        await installPlaywright(this._vscode);
+      }),
+      vscode.commands.registerCommand('pw.extension.installBrowsers', async () => {
+        if (!this._models.hasEnabledModels()) {
+          vscode.window.showWarningMessage(messageNoPlaywrightTestsFound);
           return;
         }
+        const versions = this._models.versions();
+        for (const model of versions.values())
+          await installBrowsers(this._vscode, model);
       }),
-      vscode.commands.registerCommand('pw.extension.recordTest', async () => {
-        if (!this._models.length) {
-          vscode.window.showWarningMessage('No Playwright tests found.');
+      vscode.commands.registerCommand('pw.extension.command.inspect', async () => {
+        if (!this._models.hasEnabledModels()) {
+          vscode.window.showWarningMessage(messageNoPlaywrightTestsFound);
           return;
         }
-        this._recorder.record(this._models);
+        await this._reusedBrowser.inspect(this._models);
       }),
-      vscode.commands.registerCommand('pw.extension.install', () => {
-        installPlaywright(this._vscode);
+      vscode.commands.registerCommand('pw.extension.command.closeBrowsers', () => {
+        this._reusedBrowser.closeAllBrowsers();
+      }),
+      vscode.commands.registerCommand('pw.extension.command.recordNew', async () => {
+        if (!this._models.hasEnabledModels()) {
+          vscode.window.showWarningMessage(messageNoPlaywrightTestsFound);
+          return;
+        }
+        await this._reusedBrowser.record(this._models, true);
+      }),
+      vscode.commands.registerCommand('pw.extension.command.recordAtCursor', async () => {
+        if (!this._models.hasEnabledModels()) {
+          vscode.window.showWarningMessage(messageNoPlaywrightTestsFound);
+          return;
+        }
+        await this._reusedBrowser.record(this._models, false);
+      }),
+      vscode.commands.registerCommand('pw.extension.command.toggleModels', async () => {
+        this._settingsView.toggleModels();
+      }),
+      vscode.commands.registerCommand('pw.extension.command.runGlobalSetup', async () => {
+        await this._queueGlobalHooks('setup');
+        this._settingsView.updateActions();
+      }),
+      vscode.commands.registerCommand('pw.extension.command.runGlobalTeardown', async () => {
+        await this._queueGlobalHooks('teardown');
+        this._settingsView.updateActions();
+      }),
+      vscode.commands.registerCommand('pw.extension.command.startDevServer', async () => {
+        await this._models.selectedModel()?.startDevServer();
+        this._settingsView.updateActions();
+      }),
+      vscode.commands.registerCommand('pw.extension.command.stopDevServer', async () => {
+        await this._models.selectedModel()?.stopDevServer();
+        this._settingsView.updateActions();
+      }),
+      vscode.commands.registerCommand('pw.extension.command.clearCache', async () => {
+        await this._models.selectedModel()?.clearCache();
       }),
       vscode.workspace.onDidChangeTextDocument(() => {
         if (this._completedSteps.size) {
@@ -137,169 +226,234 @@ export class Extension {
           this._executionLinesChanged();
         }
       }),
+      vscode.workspace.onDidChangeConfiguration(event => {
+        if (event.affectsConfiguration('playwright.env'))
+          this._rebuildModels(false);
+      }),
+      this._testTree,
+      this._models,
+      this._models.onUpdated(() => this._modelsUpdated()),
+      this._treeItemObserver.onTreeItemSelected(item => this._treeItemSelected(item)),
+      this._settingsView,
+      this._locatorsView,
       this._testController,
+      this._runProfile,
+      this._debugProfile,
       this._workspaceObserver,
-      this._recorder,
+      this._reusedBrowser,
+      this._diagnostics,
+      this._treeItemObserver,
+      registerTerminalLinkProvider(this._vscode),
     ];
-    this._debugHighlight.activate(context);
-    await this._rebuildModel(false);
+    const fileSystemWatchers = [
+      // Glob parser does not supported nested group, hence multiple watchers.
+      this._vscode.workspace.createFileSystemWatcher('**/*playwright*.config.{ts,js,mts,mjs}'),
+      this._vscode.workspace.createFileSystemWatcher('**/*.env*'),
+    ];
+    this._disposables.push(...fileSystemWatchers);
 
-    const fileSystemWatcher = this._vscode.workspace.createFileSystemWatcher('**/*playwright*.config.{ts,js,mjs}');
-    disposables.push(fileSystemWatcher);
     const rebuildModelForConfig = (uri: vscodeTypes.Uri) => {
       // TODO: parse .gitignore
-      if (uri.fsPath.includes('node_modules'))
+      if (uriToPath(uri).includes('node_modules'))
         return;
-      if (!this._isUnderTest && uri.fsPath.includes('test-results'))
+      if (!this._isUnderTest && uriToPath(uri).includes('test-results'))
         return;
-      this._rebuildModel(false);
+      this._rebuildModels(false);
     };
-    fileSystemWatcher.onDidChange(rebuildModelForConfig);
-    fileSystemWatcher.onDidCreate(rebuildModelForConfig);
-    fileSystemWatcher.onDidDelete(rebuildModelForConfig);
-    context.subscriptions.push(...disposables);
+
+    await this._rebuildModels(false);
+    fileSystemWatchers.map(w => w.onDidChange(rebuildModelForConfig));
+    fileSystemWatchers.map(w => w.onDidCreate(rebuildModelForConfig));
+    fileSystemWatchers.map(w => w.onDidDelete(rebuildModelForConfig));
+    this._context.subscriptions.push(this);
   }
 
-  private async _rebuildModel(showWarnings: boolean): Promise<vscodeTypes.Uri[]> {
+  private async _rebuildModels(userGesture: boolean): Promise<vscodeTypes.Uri[]> {
+    this._commandQueue = Promise.resolve();
+    this._models.clear();
     this._testTree.startedLoading();
-    this._workspaceObserver.reset();
-    this._models = [];
 
-    const configFiles = await this._vscode.workspace.findFiles('**/*playwright*.config.{ts,js,mjs}');
-
-    // Reuse already created run profiles in order to retain their 'selected' status.
-    const usedProfiles = new Set<vscodeTypes.TestRunProfile>();
-
+    const configFiles = await this._vscode.workspace.findFiles('**/*playwright*.config.{ts,js,mts,mjs}', '**/node_modules/**');
+    // findFiles returns results in a non-deterministic order - sort them to ensure consistent order when we enable the first model by default.
+    configFiles.sort((a, b) => uriToPath(a).localeCompare(uriToPath(b)));
     for (const configFileUri of configFiles) {
-      const configFilePath = configFileUri.fsPath;
+      const configFilePath = uriToPath(configFileUri);
       // TODO: parse .gitignore
-      if (configFilePath.includes('node_modules'))
-        continue;
       if (!this._isUnderTest && configFilePath.includes('test-results'))
         continue;
-      // Dogfood support
+
+      // Dog-food support
       const workspaceFolder = this._vscode.workspace.getWorkspaceFolder(configFileUri)!;
-      const workspaceFolderPath = workspaceFolder.uri.fsPath;
+      const workspaceFolderPath = uriToPath(workspaceFolder.uri);
       if (configFilePath.includes('test-results') && !workspaceFolderPath.includes('test-results'))
         continue;
-      const playwrightInfo = await this._playwrightTest.getPlaywrightInfo(workspaceFolderPath, configFilePath);
-      if (!playwrightInfo) {
-        if (showWarnings)
-          this._vscode.window.showWarningMessage('Please install Playwright Test via running `npm i --save-dev @playwright/test`');
+
+      let playwrightInfo = null;
+      try {
+        playwrightInfo = await getPlaywrightInfo(this._vscode, workspaceFolderPath, configFilePath, this._envProvider());
+      } catch (error) {
+        if (userGesture) {
+          this._vscode.window.showWarningMessage(
+              error instanceof NodeJSNotFoundError ? error.message : this._vscode.l10n.t('Please install Playwright Test via running `npm i --save-dev @playwright/test`')
+          );
+        }
+        console.error('[Playwright Test]:', (error as any)?.message);
         continue;
       }
 
-      if (playwrightInfo.version < 1.19) {
-        if (showWarnings)
-          this._vscode.window.showWarningMessage('Playwright Test v1.19 or newer is required');
+      const minimumPlaywrightVersion = 1.38;
+      if (playwrightInfo.version < minimumPlaywrightVersion) {
+        if (userGesture) {
+          this._vscode.window.showWarningMessage(
+              this._vscode.l10n.t('Playwright Test v{0} or newer is required', minimumPlaywrightVersion)
+          );
+        }
         continue;
       }
 
-      const model = new TestModel(this._vscode, this._playwrightTest, workspaceFolderPath, configFileUri.fsPath, playwrightInfo.cli);
-      this._models.push(model);
-      this._testTree.addModel(model);
-      await model.listFiles();
-
-      for (const project of model.projects.values()) {
-        await this._createRunProfile(project, usedProfiles);
-        this._workspaceObserver.addWatchFolder(project.testDir);
-      }
+      if (this.overridePlaywrightVersion)
+        playwrightInfo.version = this.overridePlaywrightVersion;
+      await this._models.createModel(workspaceFolderPath, uriToPath(configFileUri), playwrightInfo);
     }
 
-    // Clean up unused run profiles.
-    for (const [key, profile] of this._runProfiles) {
-      if (!usedProfiles.has(profile)) {
-        this._runProfiles.delete(key);
-        profile.dispose();
-      }
-    }
-
+    await this._models.ensureHasEnabledModels();
     this._testTree.finishedLoading();
-    await this._updateVisibleEditorItems();
     return configFiles;
   }
 
-  private async _createRunProfile(project: TestProject, usedProfiles: Set<vscodeTypes.TestRunProfile>) {
-    const configFile = project.model.config.configFile;
-    const configName = path.basename(configFile);
-    const folderName = path.basename(path.dirname(configFile));
-    const projectPrefix = project.name ? `${project.name} — ` : '';
-    const keyPrefix = configFile + ':' + project.name;
-    let runProfile = this._runProfiles.get(keyPrefix + ':run');
-    if (!runProfile) {
-      runProfile = this._testController.createRunProfile(`${projectPrefix}${folderName}${path.sep}${configName}`, this._vscode.TestRunProfileKind.Run, this._scheduleTestRunRequest.bind(this, configFile, project.name, false), true);
-      this._runProfiles.set(keyPrefix + ':run', runProfile);
-    }
-    let debugProfile = this._runProfiles.get(keyPrefix + ':debug');
-    if (!debugProfile) {
-      debugProfile = this._testController.createRunProfile(`${projectPrefix}${folderName}${path.sep}${configName}`, this._vscode.TestRunProfileKind.Debug, this._scheduleTestRunRequest.bind(this, configFile, project.name, true), true);
-      this._runProfiles.set(keyPrefix + ':debug', debugProfile);
-    }
-    usedProfiles.add(runProfile);
-    usedProfiles.add(debugProfile);
+  private _modelsUpdated() {
+    this._updateVisibleEditorItems();
+    this._updateDiagnostics();
+    this._workspaceObserver.setWatchFolders(this._models.testDirs());
   }
 
-  private async _scheduleTestRunRequest(configFile: string, projectName: string, isDebug: boolean, request: vscodeTypes.TestRunRequest) {
+  private _envProvider(): NodeJS.ProcessEnv {
+    const env = this._vscode.workspace.getConfiguration('playwright').get('env', {});
+    return Object.fromEntries(Object.entries(env).map(entry => {
+      return typeof entry[1] === 'string' ? entry : [entry[0], JSON.stringify(entry[1])];
+    })) as NodeJS.ProcessEnv;
+  }
+
+  private async _handleTestRun(isDebug: boolean, request: vscodeTypes.TestRunRequest, cancellationToken?: vscodeTypes.CancellationToken) {
     // Never run tests concurrently.
-    if (this._testRun)
+    if (this._testRun && !request.continuous)
       return;
 
-    // We can't dispose projects (and bind them to TestProject instances) because otherwise VS Code would forget its selection state.
-    // So bind run profiles to config file + project name pair, dynamically resolve the project.
-    const model = this._models.find(m => m.config.configFile === configFile);
-    if (!model)
-      return;
-    const project = model.projects.get(projectName);
-    if (!project)
-      return;
+    if (request.include?.[0]) {
+      const project = disabledProject(request.include[0]);
+      if (project) {
+        const enableProjectTitle = this._vscode.l10n.t('Enable project');
+        this._vscode.window.showInformationMessage(this._vscode.l10n.t(`Project is disabled in the Playwright sidebar.`), enableProjectTitle, this._vscode.l10n.t('Cancel')).then(result => {
+          if (result === enableProjectTitle) {
+            this._models.setModelEnabled(project.model.config.configFile, true, true);
+            this._models.setProjectEnabled(project.model.config.configFile, project.name, true);
+          }
+        });
+        return;
+      }
+    }
 
-    // VSCode will issue several test run requests (one per enabled run profile). Sometimes
-    // these profiles belong to the same config and we only want to run tests once per config.
-    // So we collect all requests and sort them out in the microtask.
-    if (!this._projectsScheduledToRun) {
-      this._projectsScheduledToRun = [];
-      this._projectsScheduledToRun.push(project);
-      await Promise.resolve().then(async () => {
-        const selectedProjects = this._projectsScheduledToRun!;
-        this._projectsScheduledToRun = undefined;
-        await this._runMatchingTests({ selectedProjects, isDebug, request });
-      });
-    } else {
-      // Subsequent requests will return right away.
-      this._projectsScheduledToRun.push(project);
+    await this._queueTestRun(request, isDebug ? 'debug' : 'run');
+
+    if (request.continuous) {
+      for (const model of this._models.enabledModels())
+        model.addToWatch(request.include, cancellationToken!);
     }
   }
 
-  private async _runMatchingTests(testRunInfo: TestRunInfo) {
-    const { selectedProjects, isDebug, request } = testRunInfo;
+  private async _queueTestRun(request: vscodeTypes.TestRunRequest, mode: 'run' | 'debug') {
+    await this._queueCommand(() => this._runTests(request, mode), undefined);
+  }
 
+  private async _queueWatchRun(request: vscodeTypes.TestRunRequest, type: 'files' | 'items') {
+    const batch = type === 'files' ? this._watchFilesBatch : this._watchItemsBatch;
+    const include = request.include || [];
+    if (batch) {
+      batch.push(...include); // `narrowDownLocations` dedupes before sending to the testserver, no need to dedupe here
+      return;
+    }
+
+    if (type === 'files')
+      this._watchFilesBatch = [...include];
+    else
+      this._watchItemsBatch = [...include];
+
+    await this._queueCommand(() => {
+      const items = type === 'files' ? this._watchFilesBatch : this._watchItemsBatch;
+      if (typeof items === 'undefined')
+        throw new Error(`_watchRunBatches['${type}'] is undefined, expected array`);
+
+      if (type === 'files')
+        this._watchFilesBatch = undefined;
+      else
+        this._watchItemsBatch = undefined;
+
+      return this._runTests(request, 'watch');
+    }, undefined);
+  }
+
+  private async _queueGlobalHooks(type: 'setup' | 'teardown'): Promise<reporterTypes.FullResult['status']> {
+    return await this._queueCommand(() => this._runGlobalHooks(type), 'failed');
+  }
+
+  private async _runGlobalHooks(type: 'setup' | 'teardown') {
+    if (!this._models.selectedModel()?.needsGlobalHooks(type))
+      return 'passed';
+    const request = new this._vscode.TestRunRequest();
+    const testRun = this._testController.createTestRun(request);
+    const testListener = this._errorReportingListener(testRun);
+    try {
+      const status = (await this._models.selectedModel()?.runGlobalHooks(type, testListener, testRun.token)) || 'failed';
+      return status;
+    } finally {
+      testRun.end();
+    }
+  }
+
+  private async _runTests(request: vscodeTypes.TestRunRequest, mode: 'run' | 'debug' | 'watch') {
     this._completedSteps.clear();
     this._executionLinesChanged();
-    this._testRun = this._testController.createTestRun(request);
+    const include = request.include;
 
-    // Provisionally mark tests (not files and not suits) as enqueued to provide immediate feedback.
-    for (const item of request.include || []) {
-      for (const test of this._testTree.collectTestsInside(item))
-        this._testRun.enqueued(test);
+    const rootItems: vscodeTypes.TestItem[] = [];
+    this._testController.items.forEach(item => rootItems.push(item));
+
+    // Global errors are attributed to the first test item in the request.
+    // If the request is global, find the first root test item (folder, file) that has
+    // children. It will be reveal with an error.
+    let testItemForGlobalErrors = include?.[0];
+    if (!testItemForGlobalErrors) {
+      for (const rootItem of rootItems) {
+        if (!rootItem.children.size)
+          continue;
+        rootItem.children.forEach(c => {
+          if (!testItemForGlobalErrors)
+            testItemForGlobalErrors = c;
+        });
+        if (testItemForGlobalErrors)
+          break;
+      }
     }
 
-    // Run tests with different configs sequentially, group by config.
-    const projectsToRunByModel = new Map<TestModel, TestProject[]>();
-    for (const project of selectedProjects) {
-      const projects = projectsToRunByModel.get(project.model) || [];
-      projects.push(project);
-      projectsToRunByModel.set(project.model, projects);
+    this._testRun = this._testController.createTestRun(request);
+    const enqueuedTests: vscodeTypes.TestItem[] = [];
+    // Provisionally mark tests (not files and not suits) as enqueued to provide immediate feedback.
+    const toEnqueue = include?.length ? include : rootItems;
+    for (const item of toEnqueue) {
+      for (const test of this._testTree.collectTestsInside(item)) {
+        this._testRun.enqueued(test);
+        enqueuedTests.push(test);
+      }
     }
 
     try {
-      for (const [model, projectsToRun] of projectsToRunByModel) {
-        const { projects, locations, parametrizedTestTitle } = this._narrowDownProjectsAndLocations(projectsToRun, request.include);
-        // Run if:
-        //   !locations => run all tests
-        //   locations.length => has matching items in project.
-        if (locations && !locations.length)
+      for (const model of this._models.enabledModels()) {
+        const result = model.narrowDownLocations(request);
+        if (!result.testIds && !result.locations)
           continue;
-        await this._runTest(this._testRun, new Set(), model, isDebug, projects, locations, parametrizedTestTitle);
+        if (!model.enabledProjects().length)
+          continue;
+        await this._runTest(this._testRun, request, testItemForGlobalErrors, new Set(), model, mode, enqueuedTests.length === 1);
       }
     } finally {
       this._activeSteps.clear();
@@ -309,145 +463,142 @@ export class Extension {
     }
   }
 
-  private _narrowDownProjectsAndLocations(projects: TestProject[], items: readonly vscodeTypes.TestItem[] | undefined): { projects: TestProject[], locations: string[] | null, parametrizedTestTitle: string | undefined } {
-    if (!items)
-      return { projects, locations: null, parametrizedTestTitle: undefined };
-
-    let parametrizedTestTitle: string | undefined;
-    // When we are given one item, check if it is parametrized (more than 1 item on that line).
-    // If it is parametrized, use label when running test.
-    if (items.length === 1) {
-      const test = items[0];
-      if (test.uri && test.range) {
-        let testsAtLocation = 0;
-        test.parent?.children.forEach(t => {
-          if (t.uri?.fsPath === test.uri?.fsPath && t.range?.start.line === test.range?.start.line)
-            ++testsAtLocation;
-        });
-        if (testsAtLocation > 1)
-          parametrizedTestTitle = test.label;
-      }
-    }
-
-    // Only pick projects that have tests matching test run request.
-    const locations = new Set<string>();
-    const projectsWithFiles: TestProject[] = [];
-    for (const item of items) {
-      const itemFsPath = item.uri!.fsPath;
-      const projectsWithFile = projects.filter(project => {
-        for (const file of project.files.keys()) {
-          if (file.startsWith(itemFsPath))
-            return true;
-        }
-        return false;
-      });
-      if (!projectsWithFile.length)
-        continue;
-      const line = item.range ? ':' + (item.range.start.line + 1) : '';
-      locations.add(item.uri!.fsPath + line);
-      projectsWithFiles.push(...projectsWithFile);
-    }
-    return { projects: projectsWithFiles, locations: [...locations], parametrizedTestTitle };
-  }
-
   private async _resolveChildren(fileItem: vscodeTypes.TestItem | undefined): Promise<void> {
     if (!fileItem)
       return;
-    for (const model of this._models)
-      await model.listTests([fileItem!.uri!.fsPath]);
+    await this._ensureTestsInAllModels([uriToPath(fileItem!.uri!)]);
   }
 
   private async _workspaceChanged(change: WorkspaceChange) {
-    for (const model of this._models)
-      await model.workspaceChanged(change);
+    await this._queueCommand(async () => {
+      for (const model of this._models.enabledModels())
+        await model.handleWorkspaceChange(change);
+    }, undefined);
+
     // Workspace change can be deferred, make sure editors are
     // decorated.
-    this._updateVisibleEditorItems();
+    await this._updateVisibleEditorItems();
   }
 
   private async _runTest(
     testRun: vscodeTypes.TestRun,
+    request: vscodeTypes.TestRunRequest,
+    testItemForGlobalErrors: vscodeTypes.TestItem | undefined,
     testFailures: Set<vscodeTypes.TestItem>,
     model: TestModel,
-    isDebug: boolean,
-    projects: TestProject[],
-    locations: string[] | null,
-    parametrizedTestTitle: string | undefined) {
-    const testListener: TestListener = {
-      onBegin: ({ projects }) => {
-        model.updateFromRunningProjects(projects);
-        const visit = (entry: Entry) => {
-          if (entry.type === 'test') {
-            const testItem = this._testTree.testItemForLocation(entry.location, entry.title);
-            if (testItem)
-              testRun.enqueued(testItem);
-          }
-          (entry.children || []).forEach(visit);
-        };
-        projects.forEach(visit);
+    mode: 'run' | 'debug' | 'watch',
+    enqueuedSingleTest: boolean) {
+
+    let browserDoesNotExist = false;
+
+    const testListener: reporterTypes.ReporterV2 = {
+      ...this._errorReportingListener(testRun, testItemForGlobalErrors),
+
+      onBegin: (rootSuite: reporterTypes.Suite) => {
+        model.updateFromRunningProjects(rootSuite.suites);
+        for (const test of rootSuite.allTests()) {
+          const testItem = this._testTree.testItemForTest(test);
+          if (testItem)
+            testRun.enqueued(testItem);
+        }
       },
 
-      onTestBegin: params => {
-        const testItem = this._testTree.testItemForLocation(params.location, params.title);
-        if (testItem)
+      onTestBegin: (test: reporterTypes.TestCase, result: reporterTypes.TestResult) => {
+        const testItem = this._testTree.testItemForTest(test);
+        if (testItem) {
           testRun.started(testItem);
-        if (isDebug) {
+          const fullProject = ancestorProject(test);
+          const traceUrl = `${fullProject.outputDir}/.playwright-artifacts-${result.workerIndex}/traces/${test.id}.json`;
+          (testItem as any)[traceUrlSymbol] = traceUrl;
+        }
+
+        if (testItem && enqueuedSingleTest)
+          this._showTraceOnTestProgress(testItem);
+        if (mode === 'debug') {
           // Debugging is always single-workers.
           this._testItemUnderDebug = testItem;
         }
       },
 
-      onTestEnd: params => {
+      onTestEnd: (test: reporterTypes.TestCase, result: reporterTypes.TestResult) => {
+        if (result.errors.find(e => e.message?.includes(`Error: browserType.launch: Executable doesn't exist`)))
+          browserDoesNotExist = true;
+
         this._testItemUnderDebug = undefined;
         this._activeSteps.clear();
         this._executionLinesChanged();
 
-        const testItem = this._testTree.testItemForLocation(params.location, params.title);
+        const testItem = this._testTree.testItemForTest(test);
         if (!testItem)
           return;
-        if (params.status === params.expectedStatus) {
+
+        const trace = result.attachments.find(a => a.name === 'trace')?.path || '';
+        // if trace viewer is currently displaying the trace file about to be replaced, it needs to be refreshed
+        const prevTrace = (testItem as any)[traceUrlSymbol];
+        (testItem as any)[traceUrlSymbol] = trace;
+        if (enqueuedSingleTest || prevTrace === this._models.selectedModel()?.traceViewer()?.currentFile())
+          this._showTraceOnTestProgress(testItem);
+
+        if (result.status === test.expectedStatus) {
           if (!testFailures.has(testItem)) {
-            if (params.status === 'skipped')
+            if (result.status === 'skipped')
               testRun.skipped(testItem);
             else
-              testRun.passed(testItem, params.duration);
+              testRun.passed(testItem, result.duration);
           }
           return;
         }
         testFailures.add(testItem);
-        testRun.failed(testItem, params.errors.map(error => this._testMessageForTestError(testItem, error)), params.duration);
+        testRun.failed(testItem, result.errors.map(error => this._testMessageForTestError(error)), result.duration);
       },
 
-      onStepBegin: params => {
-        const stepId = params.location.file + ':' + params.location.line;
-        let step = this._activeSteps.get(stepId);
+      onStepBegin: (test: reporterTypes.TestCase, result: reporterTypes.TestResult, testStep: reporterTypes.TestStep) => {
+        if (!testStep.location)
+          return;
+        let step = this._activeSteps.get(testStep);
         if (!step) {
           step = {
             location: new this._vscode.Location(
-                this._vscode.Uri.file(params.location.file),
-                new this._vscode.Position(params.location.line - 1, params.location.column - 1)),
+                this._vscode.Uri.file(testStep.location.file),
+                new this._vscode.Position(testStep.location.line - 1, testStep.location?.column - 1)),
             activeCount: 0,
             duration: 0,
           };
-          this._activeSteps.set(stepId, step);
+          this._activeSteps.set(testStep, step);
         }
         ++step.activeCount;
         this._executionLinesChanged();
       },
 
-      onStepEnd: params => {
-        const stepId = params.location.file + ':' + params.location.line;
-        const step = this._activeSteps.get(stepId)!;
+      onStepEnd: (test: reporterTypes.TestCase, result: reporterTypes.TestResult, testStep: reporterTypes.TestStep) => {
+        if (!testStep.location)
+          return;
+        const step = this._activeSteps.get(testStep);
         if (!step)
           return;
         --step.activeCount;
-        step.duration = params.duration;
-        this._completedSteps.set(stepId, step);
+        step.duration = testStep.duration;
+        this._completedSteps.set(testStep, step);
         if (step.activeCount === 0)
-          this._activeSteps.delete(stepId);
+          this._activeSteps.delete(testStep);
         this._executionLinesChanged();
       },
+    };
 
+    if (mode === 'debug') {
+      await model.debugTests(request, testListener, testRun.token);
+    } else {
+      // Force trace viewer update to surface check version errors.
+      await this._models.selectedModel()?.updateTraceViewer(mode === 'run')?.willRunTests();
+      await model.runTests(request, testListener, testRun.token);
+    }
+
+    if (browserDoesNotExist)
+      await installBrowsers(this._vscode, model);
+  }
+
+  private _errorReportingListener(testRun: vscodeTypes.TestRun, testItemForGlobalErrors?: vscodeTypes.TestItem) {
+    const testListener: reporterTypes.ReporterV2 = {
       onStdOut: data => {
         testRun.appendOutput(data.toString().replace(/\n/g, '\r\n'));
       },
@@ -455,28 +606,83 @@ export class Extension {
       onStdErr: data => {
         testRun.appendOutput(data.toString().replace(/\n/g, '\r\n'));
       },
-    };
 
-    if (isDebug)
-      await model.debugTests(projects, locations, testListener, parametrizedTestTitle, testRun.token);
-    else
-      await model.runTests(projects, locations, testListener, parametrizedTestTitle, testRun.token);
+      onError: (error: reporterTypes.TestError) => {
+        // Global errors don't have associated tests, so we'll be allocating them
+        // to the first item / current.
+        if (testItemForGlobalErrors) {
+          // Force UI to reveal the item if that is a file that has never been started.
+          testRun.started(testItemForGlobalErrors);
+          testRun.failed(testItemForGlobalErrors, this._testMessageForTestError(error), 0);
+        } else if (error.location) {
+          testRun.appendOutput(error.message || error.value || '', new this._vscode.Location(this._vscode.Uri.file(error.location.file), new this._vscode.Position(error.location.line - 1, error.location.column - 1)));
+        } else {
+          testRun.appendOutput(error.message || error.value || '');
+        }
+      }
+    };
+    return testListener;
+  }
+
+  private async _runWatchedTests(files: string[], testItems: vscodeTypes.TestItem[]) {
+    // Run either locations or test ids to always be compatible with the test server (it can run either or).
+    if (files.length) {
+      const fileItems = files.map(f => this._testTree.testItemForFile(f)).filter(Boolean) as vscodeTypes.TestItem[];
+      await this._queueWatchRun(new this._vscode.TestRunRequest(fileItems), 'files');
+    }
+    if (testItems.length)
+      await this._queueWatchRun(new this._vscode.TestRunRequest(testItems), 'items');
   }
 
   private async _updateVisibleEditorItems() {
-    const files = this._vscode.window.visibleTextEditors.map(e => e.document.uri.fsPath);
-    if (files.length) {
-      for (const model of this._models)
-        await model.listTests(files);
-    }
+    const files = this._vscode.window.visibleTextEditors.map(e => uriToPath(e.document.uri));
+    await this._ensureTestsInAllModels(files);
   }
 
-  private _errorInDebugger(errorStack: string, location: DebuggerLocation) {
+  private async _ensureTestsInAllModels(inputFiles: string[]): Promise<void> {
+    await this._queueCommand(async () => {
+      for (const model of this._models.enabledModels())
+        await model.ensureTests(inputFiles);
+    }, undefined);
+  }
+
+  private _updateDiagnostics() {
+    this._diagnostics.clear();
+    const diagnosticsByFile = new Map<string, Map<string, vscodeTypes.Diagnostic>>();
+
+    const addError = (error: reporterTypes.TestError) => {
+      if (!error.location)
+        return;
+      let diagnostics = diagnosticsByFile.get(error.location.file);
+      if (!diagnostics) {
+        diagnostics = new Map();
+        diagnosticsByFile.set(error.location.file, diagnostics);
+      }
+      const key = `${error.location?.line}:${error.location?.column}:${error.message}`;
+      if (!diagnostics.has(key)) {
+        diagnostics.set(key, {
+          severity: this._vscode.DiagnosticSeverity.Error,
+          source: 'playwright',
+          range: new this._vscode.Range(Math.max(error.location!.line - 1, 0), Math.max(error.location!.column - 1, 0), error.location!.line, 0),
+          message: this._abbreviateStack(stripBabelFrame(stripAnsi(error.message!))),
+        });
+      }
+    };
+
+    for (const model of this._models.enabledModels()) {
+      for (const error of model.errors().values())
+        addError(error);
+    }
+    for (const [file, diagnostics] of diagnosticsByFile)
+      this._diagnostics.set(this._vscode.Uri.file(file), [...diagnostics.values()]);
+  }
+
+  private _errorInDebugger(errorStack: string, location: reporterTypes.Location) {
     if (!this._testRun || !this._testItemUnderDebug)
       return;
     const testMessage = this._testMessageFromText(errorStack);
     const position = new this._vscode.Position(location.line - 1, location.column - 1);
-    testMessage.location = new this._vscode.Location(this._vscode.Uri.file(location.path), position);
+    testMessage.location = new this._vscode.Location(this._vscode.Uri.file(location.file), position);
     this._testRun.failed(this._testItemUnderDebug, testMessage);
     this._testItemUnderDebug = undefined;
   }
@@ -486,101 +692,198 @@ export class Extension {
     const completed = [...this._completedSteps.values()];
 
     for (const editor of this._vscode.window.visibleTextEditors) {
+      const editorPath = uriToPath(editor.document.uri);
       const activeDecorations: vscodeTypes.DecorationOptions[] = [];
       for (const { location } of active) {
-        if (location.uri.fsPath === editor.document.uri.fsPath)
+        if (uriToPath(location.uri) === editorPath)
           activeDecorations.push({ range: location.range });
       }
 
-      const completedDecorations: vscodeTypes.DecorationOptions[] = [];
+      const completedDecorations: Record<number, vscodeTypes.DecorationOptions> = {};
       for (const { location, duration } of completed) {
-        if (location.uri.fsPath === editor.document.uri.fsPath) {
-          completedDecorations.push({
+        if (uriToPath(location.uri) === editorPath) {
+          const line = location.range.start.line;
+          completedDecorations[line] = {
             range: location.range,
             renderOptions: {
               after: {
                 contentText: ` \u2014 ${duration}ms`
               }
             }
-          });
+          };
         }
       }
 
       editor.setDecorations(this._activeStepDecorationType, activeDecorations);
-      editor.setDecorations(this._completedStepDecorationType, completedDecorations);
+      editor.setDecorations(this._completedStepDecorationType, Object.values(completedDecorations));
     }
 
+  }
+
+  private _abbreviateStack(text: string): string {
+    const result: string[] = [];
+    const prefixes = (this._vscode.workspace.workspaceFolders || []).map(f => uriToPath(f.uri).toLowerCase() + path.sep);
+    for (let line of text.split('\n')) {
+      const lowerLine = line.toLowerCase();
+      for (const prefix of prefixes) {
+        const index = lowerLine.indexOf(prefix);
+        if (index !== -1) {
+          line = line.substring(0, index) + line.substring(index + prefix.length);
+          break;
+        }
+      }
+      result.push(line);
+    }
+    return result.join('\n');
   }
 
   private _testMessageFromText(text: string): vscodeTypes.TestMessage {
-    let isLog = false;
-    const md: string[] = [];
-    const logMd: string[] = [];
-    for (let line of text.split('\n')) {
-      if (line.startsWith('    at ')) {
-        // Render relative stack.
-        for (const workspaceFolder of this._vscode.workspace.workspaceFolders || []) {
-          const prefix = '    at ' + workspaceFolder.uri.fsPath;
-          if (line.startsWith(prefix)) {
-            line = '    at ' + line.substring(prefix.length + 1);
-            break;
-          }
-        }
-      }
-      if (line.includes('=====') && line.includes('log')) {
-        isLog = true;
-        logMd.push('\n\n**Execution log**');
-        continue;
-      }
-      if (line.includes('=====')) {
-        isLog = false;
-        continue;
-      }
-      if (isLog) {
-        const [, indent, body] = line.match(/(\s*)(.*)/)!;
-        logMd.push(indent + ' - ' + body);
-      } else {
-        md.push(line);
-      }
-    }
     const markdownString = new this._vscode.MarkdownString();
     markdownString.isTrusted = true;
     markdownString.supportHtml = true;
-    markdownString.appendMarkdown(ansiToHtml(md.join('\n')));
-    if (logMd.length)
-      markdownString.appendMarkdown(logMd.join('\n'));
+    markdownString.appendMarkdown(ansi2html(this._abbreviateStack(text)));
     return new this._vscode.TestMessage(markdownString);
   }
 
-  private _testMessageForTestError(testItem: vscodeTypes.TestItem, error: TestError): vscodeTypes.TestMessage {
-    const text = error.stack || error.message || error.value!;
-    const testMessage = this._testMessageFromText(text);
-    const location = parseLocationFromStack(testItem, error.stack);
-    if (location) {
-      const position = new this._vscode.Position(location.line - 1, location.column - 1);
-      testMessage.location = new this._vscode.Location(this._vscode.Uri.file(location.path), position);
+  private _testMessageFromHtml(html: string): vscodeTypes.TestMessage {
+    // We need to trim each line on the left side so that Markdown will render it as HTML.
+    const trimmedLeft = html.split('\n').join('').trimStart();
+    const markdownString = new this._vscode.MarkdownString(trimmedLeft);
+    markdownString.isTrusted = true;
+    markdownString.supportHtml = true;
+    return new this._vscode.TestMessage(markdownString);
+  }
+
+  private _testMessageForTestError(error: reporterTypes.TestError): vscodeTypes.TestMessage {
+    const text = this._formatError(error);
+    let testMessage: vscodeTypes.TestMessage;
+    if (text.includes('Looks like Playwright Test or Playwright')) {
+      testMessage = this._testMessageFromHtml(`
+        <p>Playwright browser are not installed.</p>
+        <p>
+          Press
+          ${process.platform === 'darwin' ? '<kbd>Shift</kbd>+<kbd>Command</kbd>+<kbd>P</kbd>' : ''}
+          ${process.platform !== 'darwin' ? '<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>' : ''}
+          to open the Command Palette in VSCode, type 'Playwright' and select 'Install Playwright Browsers'.
+        </p>
+      `);
+    } else {
+      testMessage = this._testMessageFromText(text);
     }
+    const stackTrace = error.stack ? parseStack(this._vscode, error.stack) : [];
+    const location = error.location ? parseLocation(this._vscode, error.location) : topStackFrame(this._vscode, stackTrace);
+    if (location)
+      testMessage.location = location;
     return testMessage;
   }
 
+  private _formatError(error: reporterTypes.TestError): string {
+    const tokens = [error.stack || error.message || error.value || ''];
+    if (error.cause)
+      tokens.push('[cause]: ' + this._formatError(error.cause));
+    return tokens.join('\n');
+  }
+
   playwrightTestLog(): string[] {
-    return this._playwrightTest.testLog();
+    return this._playwrightTestLog;
+  }
+
+  browserServerWSForTest() {
+    return this._reusedBrowser.browserServerWSEndpoint();
+  }
+
+  fireTreeItemSelectedForTest(testItem: vscodeTypes.TestItem | null) {
+    this._treeItemSelected(testItem);
+  }
+
+  async traceViewerInfoForTest() {
+    return await this._models.selectedModel()?.traceViewer()?.infoForTest();
+  }
+
+  private _showTraceOnTestProgress(testItem: vscodeTypes.TestItem) {
+    const traceUrl = (testItem as any)[traceUrlSymbol];
+    this._models.selectedModel()?.traceViewer()?.open(traceUrl);
+  }
+
+  private _treeItemSelected(treeItem: vscodeTypes.TreeItem | null) {
+    if (!treeItem)
+      return;
+    const traceUrl = (treeItem as any)[traceUrlSymbol];
+    this._models.selectedModel()?.traceViewer()?.open(traceUrl);
+  }
+
+  private _queueCommand<T>(callback: () => Promise<T>, defaultValue: T): Promise<T> {
+    const result = this._commandQueue.then(callback).catch(e => { console.error(e); return defaultValue; });
+    this._commandQueue = result.then(() => {});
+    return result;
   }
 }
 
-function parseLocationFromStack(testItem: vscodeTypes.TestItem, stack: string | undefined): DebuggerLocation | undefined {
+function parseLocation(vscode: vscodeTypes.VSCode, location: reporterTypes.Location): vscodeTypes.Location {
+  return new vscode.Location(
+      vscode.Uri.file(location.file),
+      new vscode.Position(location.line - 1, location.column - 1));
+}
+
+function topStackFrame(vscode: vscodeTypes.VSCode, stackTrace: vscodeTypes.TestMessageStackFrame[]): vscodeTypes.Location | undefined {
+  return stackTrace.length ? new vscode.Location(stackTrace[0].uri!, stackTrace[0].position!) : undefined;
+}
+
+function parseStack(vscode: vscodeTypes.VSCode, stack: string): vscodeTypes.TestMessageStackFrame[] {
   const lines = stack?.split('\n') || [];
+  const result: vscodeTypes.TestMessageStackFrame[] = [];
   for (const line of lines) {
     const frame = stackUtils.parseLine(line);
     if (!frame || !frame.file || !frame.line || !frame.column)
       continue;
-    frame.file = frame.file.replace(/\//g, path.sep);
-    if (testItem.uri!.fsPath === frame.file) {
-      return {
-        path: frame.file,
-        line: frame.line,
-        column: frame.column,
-      };
+    result.push(new vscode.TestMessageStackFrame(
+        frame.method || '',
+        vscode.Uri.file(frame.file),
+        new vscode.Position(frame.line - 1, frame.column - 1)));
+  }
+  return result;
+}
+
+class TreeItemObserver implements vscodeTypes.Disposable{
+  private _vscode: vscodeTypes.VSCode;
+  private _treeItemSelected: vscodeTypes.EventEmitter<vscodeTypes.TreeItem | null>;
+  readonly onTreeItemSelected: vscodeTypes.Event<vscodeTypes.TreeItem | null>;
+  private _selectedTreeItem: vscodeTypes.TreeItem | null = null;
+  private _timeout: NodeJS.Timeout | undefined;
+
+  constructor(vscode: vscodeTypes.VSCode) {
+    this._vscode = vscode;
+    this._treeItemSelected = new vscode.EventEmitter();
+    this.onTreeItemSelected = this._treeItemSelected.event;
+    this._poll().catch(() => {});
+  }
+
+  dispose() {
+    clearTimeout(this._timeout);
+    this._treeItemSelected.dispose();
+  }
+
+  selectedTreeItem(): vscodeTypes.TreeItem | null {
+    return this._selectedTreeItem;
+  }
+
+  private async _poll() {
+    clearTimeout(this._timeout);
+    const result = await this._vscode.commands.executeCommand('testing.getExplorerSelection') as { include: vscodeTypes.TreeItem[] };
+    const item = result.include.length === 1 ? result.include[0] : null;
+    if (item !== this._selectedTreeItem) {
+      this._selectedTreeItem = item;
+      this._treeItemSelected.fire(item);
     }
+    this._timeout = setTimeout(() => this._poll().catch(() => {}), 250);
   }
 }
+
+function ancestorProject(test: reporterTypes.TestCase): reporterTypes.FullProject {
+  let suite: reporterTypes.Suite = test.parent;
+  while (!suite.project())
+    suite = suite.parent!;
+  return suite.project()!;
+}
+
+const traceUrlSymbol = Symbol('traceUrl');

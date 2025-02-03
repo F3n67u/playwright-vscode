@@ -14,69 +14,83 @@
  * limitations under the License.
  */
 
-import { discardBabelAstCache, locatorForSourcePosition } from './babelHighlightUtil';
+import { locatorForSourcePosition, pruneAstCaches } from './babelHighlightUtil';
 import { debugSessionName } from './debugSessionName';
+import { replaceActionWithLocator, locatorMethodRegex } from './methodNames';
+import type { Location } from './upstream/reporter';
+import { ReusedBrowser } from './reusedBrowser';
 import * as vscodeTypes from './vscodeTypes';
+import { normalizePath, uriToPath } from './utils';
 
-export type DebuggerLocation = { path: string, line: number, column: number };
-export type DebuggerError = { error: string, location: DebuggerLocation };
-
-const debugSessions = new Map<string, vscodeTypes.DebugSession>();
+export type DebuggerError = { error: string, location: Location };
 
 export class DebugHighlight {
-  private _vscode: vscodeTypes.VSCode;
-  private _errorInDebugger: vscodeTypes.EventEmitter<DebuggerError>;
+  private _debugSessions = new Map<string, vscodeTypes.DebugSession>();
+  private _onErrorInDebuggerEmitter: vscodeTypes.EventEmitter<DebuggerError>;
   readonly onErrorInDebugger: vscodeTypes.Event<DebuggerError>;
+  private _onStdOutEmitter: vscodeTypes.EventEmitter<string>;
+  readonly onStdOut: vscodeTypes.Event<string>;
+  private _disposables: vscodeTypes.Disposable[] = [];
+  private _reusedBrowser: ReusedBrowser;
 
-  constructor(vscode: vscodeTypes.VSCode) {
-    this._vscode = vscode;
-    this._errorInDebugger = new vscode.EventEmitter();
-    this.onErrorInDebugger = this._errorInDebugger.event;
-  }
+  constructor(vscode: vscodeTypes.VSCode, reusedBrowser: ReusedBrowser) {
+    this._reusedBrowser = reusedBrowser;
+    this._onErrorInDebuggerEmitter = new vscode.EventEmitter();
+    this.onErrorInDebugger = this._onErrorInDebuggerEmitter.event;
+    this._onStdOutEmitter = new vscode.EventEmitter();
+    this.onStdOut = this._onStdOutEmitter.event;
 
-  async activate(context: vscodeTypes.ExtensionContext) {
-    const vscode = this._vscode;
     const self = this;
-    const disposables = [
+    this._disposables = [
+      this._onErrorInDebuggerEmitter,
+      this._onStdOutEmitter,
       vscode.debug.onDidStartDebugSession(session => {
         if (isPlaywrightSession(session))
-          debugSessions.set(session.id, session);
+          this._debugSessions.set(session.id, session);
       }),
       vscode.debug.onDidTerminateDebugSession(session => {
-        debugSessions.delete(session.id);
-        hideHighlight();
-        discardHighlightCaches();
+        this._debugSessions.delete(session.id);
+        self._hideHighlight();
       }),
       vscode.languages.registerHoverProvider('typescript', {
         provideHover(document, position, token) {
-          highlightLocator(document, position, token).catch();
+          self._highlightLocator(document, position, token).catch();
           return null;
         }
       }),
       vscode.languages.registerHoverProvider('javascript', {
         provideHover(document, position, token) {
-          highlightLocator(document, position, token).catch();
+          self._highlightLocator(document, position, token).catch();
           return null;
         }
       }),
       vscode.window.onDidChangeTextEditorSelection(event => {
-        highlightLocator(event.textEditor.document, event.selections[0].start).catch();
+        self._highlightLocator(event.textEditor.document, event.selections[0].start).catch();
+      }),
+      vscode.window.onDidChangeVisibleTextEditors(event => {
+        pruneHighlightCaches(vscode.window.visibleTextEditors.map(e => e.document.fileName));
       }),
       vscode.debug.registerDebugAdapterTrackerFactory('*', {
         createDebugAdapterTracker(session: vscodeTypes.DebugSession) {
           if (!isPlaywrightSession(session))
             return {};
 
-          let lastCatchLocation: DebuggerLocation | undefined;
+          let lastCatchLocation: Location | undefined;
           return {
             onDidSendMessage: async message => {
+              if (message.type === 'event' && message.event === 'output') {
+                if (message.body.category === 'stdout') {
+                  const output = message.body.output;
+                  self._onStdOutEmitter.fire(output);
+                }
+              }
               if (!message.success)
                 return;
               if (message.command === 'scopes' && message.type === 'response') {
                 const catchBlock = message.body.scopes.find((scope: any) => scope.name === 'Catch Block');
                 if (catchBlock) {
                   lastCatchLocation = {
-                    path: catchBlock.source.path,
+                    file: catchBlock.source.path,
                     line: catchBlock.line,
                     column: catchBlock.column
                   };
@@ -84,10 +98,10 @@ export class DebugHighlight {
               }
 
               if (message.command === 'variables' && message.type === 'response') {
-                const errorVariable = message.body.variables.find((v: any) => v.name === 'playwrightError' && v.type === 'error');
+                const errorVariable = message.body.variables.find((v: any) => v.name === 'playwrightError' && v.type && v.type.toLowerCase() === 'error');
                 if (errorVariable && lastCatchLocation) {
                   const error = errorVariable.value as string;
-                  self._errorInDebugger.fire({
+                  self._onErrorInDebuggerEmitter.fire({
                     error: error.replace(/\\n/g, '\n'),
                     location: lastCatchLocation!
                   });
@@ -98,24 +112,68 @@ export class DebugHighlight {
         }
       }),
     ];
-    context.subscriptions.push(...disposables);
   }
 
+  private async _highlightLocator(document: vscodeTypes.TextDocument, position: vscodeTypes.Position, token?: vscodeTypes.CancellationToken) {
+    if (!this._reusedBrowser.pageCount())
+      return;
+    const result = await locatorToHighlight(this._debugSessions, document, position, token);
+    if (result)
+      this._reusedBrowser.highlight(result).catch(() => {});
+    else
+      this._hideHighlight();
+  }
+
+  private _hideHighlight() {
+    this._reusedBrowser.hideHighlight();
+  }
+
+  dispose() {
+    for (const d of this._disposables)
+      d?.dispose?.();
+    this._disposables = [];
+  }
 }
 
 export type StackFrame = {
   id: string;
   line: number;
   column: number;
-  source: { path: string };
+  source?: { path: string };
 };
 
 const sessionsWithHighlight = new Set<vscodeTypes.DebugSession>();
 
-export async function highlightLocator(document: vscodeTypes.TextDocument, position: vscodeTypes.Position, token?: vscodeTypes.CancellationToken) {
-  if (!debugSessions.size)
+async function locatorToHighlight(debugSessions: Map<string, vscodeTypes.DebugSession>, document: vscodeTypes.TextDocument, position: vscodeTypes.Position, token?: vscodeTypes.CancellationToken): Promise<string | undefined> {
+  const fsPath = uriToPath(document.uri);
+
+  if (!debugSessions.size) {
+    // When not debugging, discover all the locator-alike expressions.
+    const text = document.getText();
+    const line = document.lineAt(position.line);
+    if (!line.text.match(locatorMethodRegex))
+      return;
+    let locatorExpression = locatorForSourcePosition(text, { pages: [], locators: [] }, fsPath, {
+      line: position.line + 1,
+      column: position.character + 1
+    });
+    // Translate locator expressions starting with "component." to be starting with "page.".
+    locatorExpression = locatorExpression?.replace(/^component\s*\./, `page.locator('#root').locator('internal:control=component').`);
+    // Translate 'this.page', or 'this._page' to 'page' to have best-effort support for POMs.
+    locatorExpression = locatorExpression?.replace(/this\._?page\s*\./, 'page.');
+    // Translate page.click() to page.locator()
+    locatorExpression = locatorExpression ? replaceActionWithLocator(locatorExpression) : undefined;
+    // Only consider locator expressions starting with "page." because we know the base for them (root).
+    // Other locators can be relative.
+    const match = locatorExpression?.match(/^page\s*\.([\s\S]*)/m);
+    if (match) {
+      // It is Ok to return the locator expression, not the selector because the highlight call is going to handle it
+      // just fine.
+      return match[1];
+    }
     return;
-  const fsPath = document.uri.fsPath;
+  }
+
   for (const session of debugSessions.values()) {
     if (token?.isCancellationRequested)
       return;
@@ -123,7 +181,10 @@ export async function highlightLocator(document: vscodeTypes.TextDocument, posit
     if (!stackFrames)
       continue;
     for (const stackFrame of stackFrames) {
-      if (!stackFrame.source || document.uri.fsPath !== stackFrame.source.path)
+      if (!stackFrame.source)
+        continue;
+      const sourcePath = mapRemoteToLocalPath(stackFrame.source.path);
+      if (!sourcePath || fsPath !== normalizePath(sourcePath))
         continue;
       if (token?.isCancellationRequested)
         return;
@@ -137,11 +198,11 @@ export async function highlightLocator(document: vscodeTypes.TextDocument, posit
         continue;
       if (token?.isCancellationRequested)
         return;
-      if (await doHighlightLocator(session, stackFrame.id, locatorExpression))
-        return;
+      const result = await computeLocatorForHighlight(session, stackFrame.id, locatorExpression);
+      if (result)
+        return result;
     }
   }
-  await hideHighlight();
 }
 
 async function pausedStackFrames(session: vscodeTypes.DebugSession, threadId: number | undefined): Promise<StackFrame[] | undefined> {
@@ -182,28 +243,23 @@ async function scopeVariables(session: vscodeTypes.DebugSession, stackFrame: Sta
   return { pages, locators };
 }
 
-async function doHighlightLocator(session: vscodeTypes.DebugSession, frameId: string, locatorExpression: string) {
-  const expression = `(${locatorExpression})._highlight()`;
+async function computeLocatorForHighlight(session: vscodeTypes.DebugSession, frameId: string, locatorExpression: string): Promise<string> {
+  const innerExpression = `(${locatorExpression})._selector`;
+  const base64Encoded = Buffer.from(innerExpression).toString('base64');
+  const expression = `eval(Buffer.from("${base64Encoded}", "base64").toString())`;
   sessionsWithHighlight.add(session);
-  const result = await session.customRequest('evaluate', {
+  return await session.customRequest('evaluate', {
     expression,
     frameId,
-  }).then(result => result, () => undefined);
-  return !!result;
+  }).then(result => {
+    if (result.result.startsWith('\'') && result.result.endsWith('\''))
+      return result.result.substring(1, result.result.length - 1);
+    return result.result;
+  }, () => undefined);
 }
 
-export async function hideHighlight() {
-  const copy = new Set([...sessionsWithHighlight]);
-  sessionsWithHighlight.clear();
-  for (const session of copy) {
-    await session.customRequest('evaluate', {
-      expression: 'global._playwrightInstance._hideHighlight().catch(() => {})',
-    }).then(result => result, () => undefined);
-  }
-}
-
-export function discardHighlightCaches() {
-  discardBabelAstCache();
+export function pruneHighlightCaches(fsPathsToRetain: string[]) {
+  pruneAstCaches(fsPathsToRetain);
 }
 
 function isPlaywrightSession(session: vscodeTypes.DebugSession): boolean {
@@ -211,4 +267,19 @@ function isPlaywrightSession(session: vscodeTypes.DebugSession): boolean {
   while (rootSession.parentSession)
     rootSession = rootSession.parentSession;
   return rootSession.name === debugSessionName;
+}
+
+/**
+ * From WSL:
+ * vscode-remote://wsl%2Bubuntu/mnt/c/Users/john/doe/foo.spec.ts -> /mnt/c/Users/john/doe/foo.spec.ts
+ */
+function mapRemoteToLocalPath(maybeRemoteUri?: string): string | undefined {
+  if (!maybeRemoteUri)
+    return;
+  if (maybeRemoteUri.startsWith('vscode-remote://')) {
+    const decoded = decodeURIComponent(maybeRemoteUri.substring(16));
+    const separator = decoded.indexOf('/');
+    return decoded.slice(separator, decoded.length);
+  }
+  return maybeRemoteUri;
 }

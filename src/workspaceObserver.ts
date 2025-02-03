@@ -16,6 +16,7 @@
 
 import path from 'path';
 import * as vscodeTypes from './vscodeTypes';
+import { uriToPath } from './utils';
 
 export type WorkspaceChange = {
   created: Set<string>;
@@ -25,31 +26,48 @@ export type WorkspaceChange = {
 
 export class WorkspaceObserver {
   private _vscode: vscodeTypes.VSCode;
-  private _fileSystemWatchers: vscodeTypes.FileSystemWatcher[] = [];
   private _handler: (change: WorkspaceChange) => void;
   private _pendingChange: WorkspaceChange | undefined;
   private _timeout: NodeJS.Timeout | undefined;
+  private _folderWatchers = new Map<string, vscodeTypes.Disposable[]>();
 
   constructor(vscode: vscodeTypes.VSCode, handler: (change: WorkspaceChange) => void) {
     this._vscode = vscode;
     this._handler = handler;
   }
 
-  addWatchFolder(folder: string) {
-    const fileSystemWatcher = this._vscode.workspace.createFileSystemWatcher(folder + path.sep + '**');
-    fileSystemWatcher.onDidCreate(uri => {
-      if (uri.scheme === 'file')
-        this._change().created.add(uri.fsPath);
-    });
-    fileSystemWatcher.onDidChange(uri => {
-      if (uri.scheme === 'file')
-        this._change().changed.add(uri.fsPath);
-    });
-    fileSystemWatcher.onDidDelete(uri => {
-      if (uri.scheme === 'file')
-        this._change().deleted.add(uri.fsPath);
-    });
-    this._fileSystemWatchers.push(fileSystemWatcher);
+  setWatchFolders(folders: Set<string>) {
+    for (const folder of folders) {
+      if (this._folderWatchers.has(folder))
+        continue;
+
+      // Make sure to use lowercase drive letter in the pattern.
+      // eslint-disable-next-line no-restricted-properties
+      const watcher = this._vscode.workspace.createFileSystemWatcher(this._vscode.Uri.file(folder).fsPath.replaceAll(path.sep, '/') + '/**');
+      const disposables: vscodeTypes.Disposable[] = [
+        watcher.onDidCreate(uri => {
+          if (uri.scheme === 'file')
+            this._change().created.add(uriToPath(uri));
+        }),
+        watcher.onDidChange(uri => {
+          if (uri.scheme === 'file')
+            this._change().changed.add(uriToPath(uri));
+        }),
+        watcher.onDidDelete(uri => {
+          if (uri.scheme === 'file')
+            this._change().deleted.add(uriToPath(uri));
+        }),
+        watcher,
+      ];
+      this._folderWatchers.set(folder, disposables);
+    }
+
+    for (const [folder, disposables] of this._folderWatchers) {
+      if (!folders.has(folder)) {
+        disposables.forEach(d => d.dispose());
+        this._folderWatchers.delete(folder);
+      }
+    }
   }
 
   private _change(): WorkspaceChange {
@@ -62,7 +80,7 @@ export class WorkspaceObserver {
     }
     if (this._timeout)
       clearTimeout(this._timeout);
-    this._timeout = setTimeout(() => this._reportChange(), 500);
+    this._timeout = setTimeout(() => this._reportChange(), 50);
     return this._pendingChange;
   }
 
@@ -73,13 +91,10 @@ export class WorkspaceObserver {
   }
 
   dispose() {
-    this.reset();
-  }
-
-  reset() {
     if (this._timeout)
       clearTimeout(this._timeout);
-    this._fileSystemWatchers.forEach(f => f.dispose());
-    this._fileSystemWatchers = [];
+    for (const disposables of this._folderWatchers.values())
+      disposables.forEach(d => d.dispose());
+    this._folderWatchers.clear();
   }
 }

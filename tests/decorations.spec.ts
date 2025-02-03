@@ -14,13 +14,10 @@
  * limitations under the License.
  */
 
-import { expect, test } from '@playwright/test';
-import { activate } from './utils';
+import { escapedPathSep, expect, test } from './utils';
 
-test.describe.configure({ mode: 'parallel' });
-
-test('should highlight steps while running', async ({}, testInfo) => {
-  const { vscode, testController, renderExecLog } = await activate(testInfo.outputDir, {
+test('should highlight steps while running', async ({ activate }) => {
+  const { vscode, testController } = await activate({
     'playwright.config.js': `module.exports = { testDir: 'tests' }`,
     'tests/test.spec.ts': `
       import { test, expect } from '@playwright/test';
@@ -38,11 +35,11 @@ test('should highlight steps while running', async ({}, testInfo) => {
   await testController.run();
   expect(vscode.window.activeTextEditor.renderDecorations('  ')).toBe(`
     --------------------------------------------------------------
-    
+
     --------------------------------------------------------------
     [3:18 - 3:18]: decorator #1
     --------------------------------------------------------------
-    
+
     --------------------------------------------------------------
     [3:18 - 3:18]: decorator #2 {"after":{"contentText":" — Xms"}}
     --------------------------------------------------------------
@@ -66,9 +63,49 @@ test('should highlight steps while running', async ({}, testInfo) => {
     [5:18 - 5:18]: decorator #2 {"after":{"contentText":" — Xms"}}
   `);
 
-  expect(renderExecLog('  ')).toBe(`
+  await expect(vscode).toHaveExecLog(`
     > playwright list-files -c playwright.config.js
-    > playwright test -c playwright.config.js --list tests/test.spec.ts
+    > playwright test -c playwright.config.js --list --reporter=null tests/test.spec.ts
     > playwright test -c playwright.config.js
   `);
+  await expect(vscode).toHaveConnectionLog([
+    { method: 'listFiles', params: {} },
+    {
+      method: 'listTests',
+      params: expect.objectContaining({
+        locations: [expect.stringContaining(`tests${escapedPathSep}test\\.spec\\.ts`)]
+      })
+    },
+    { method: 'runGlobalSetup', params: {} },
+    {
+      method: 'runTests',
+      params: expect.objectContaining({
+        locations: [],
+        testIds: undefined
+      })
+    },
+  ]);
+});
+
+test('should limit highlights', async ({ activate }) => {
+  const { vscode, testController } = await activate({
+    'playwright.config.js': `module.exports = { testDir: 'tests' }`,
+    'tests/test.spec.ts': `
+      import { test, expect } from '@playwright/test';
+      test('pass', async () => {  
+        for (let i = 0; i < 2000; i++) {
+          expect(i).toBe(i);
+        }
+      });
+    `,
+  });
+
+  await vscode.openEditors('**/test.spec.ts');
+  await new Promise(f => testController.onDidChangeTestItem(f));
+
+  await testController.run();
+
+  const decorationsLog = vscode.window.activeTextEditor.renderDecorations('  ');
+  const lastState = decorationsLog.substring(decorationsLog.lastIndexOf('------'));
+  expect(lastState.split('\n').length).toBeLessThan(2000);
 });

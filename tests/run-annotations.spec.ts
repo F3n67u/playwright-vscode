@@ -14,13 +14,10 @@
  * limitations under the License.
  */
 
-import { expect, test } from '@playwright/test';
-import { activate } from './utils';
+import { expect, test } from './utils';
 
-test.describe.configure({ mode: 'parallel' });
-
-test('should mark test as skipped', async ({}, testInfo) => {
-  const { testController, renderExecLog } = await activate(testInfo.outputDir, {
+test('should mark test as skipped', async ({ activate }) => {
+  const { vscode, testController } = await activate({
     'playwright.config.js': `module.exports = { testDir: 'tests' }`,
     'tests/test.spec.ts': `
       import { test } from '@playwright/test';
@@ -40,26 +37,37 @@ test('should mark test as skipped', async ({}, testInfo) => {
 
   const testRun = await testController.run();
   expect(testRun.renderLog()).toBe(`
-    fails [9:0]
+    tests > test.spec.ts > pass [2:0]
       enqueued
       started
       passed
-    fixme [6:0]
+    tests > test.spec.ts > skipped [3:0]
       enqueued
       started
       skipped
-    pass [2:0]
+    tests > test.spec.ts > fixme [6:0]
+      enqueued
+      started
+      skipped
+    tests > test.spec.ts > fails [9:0]
       enqueued
       started
       passed
-    skipped [3:0]
-      enqueued
-      started
-      skipped
   `);
 
-  expect(renderExecLog('  ')).toBe(`
+  await expect(vscode).toHaveExecLog(`
     > playwright list-files -c playwright.config.js
     > playwright test -c playwright.config.js
   `);
+  await expect(vscode).toHaveConnectionLog([
+    { method: 'listFiles', params: {} },
+    { method: 'runGlobalSetup', params: {} },
+    {
+      method: 'runTests',
+      params: expect.objectContaining({
+        locations: [],
+        testIds: undefined
+      })
+    },
+  ]);
 });

@@ -14,21 +14,35 @@
  * limitations under the License.
  */
 
+import path from 'path';
 import * as http from 'http';
 import WebSocket, { WebSocketServer } from 'ws';
 import { ConnectionTransport } from './transport';
 import { createGuid } from './utils';
+import * as vscodeTypes from './vscodeTypes';
+import * as reporterTypes from './upstream/reporter';
+import { TeleReporterReceiver } from './upstream/teleReceiver';
 
-export class DebugServer {
+export class ReporterServer {
   private _clientSocketPromise: Promise<WebSocket>;
   private _clientSocketCallback!: (socket: WebSocket) => void;
   private _wsServer: WebSocketServer | undefined;
+  private _vscode: vscodeTypes.VSCode;
 
-  constructor() {
+  constructor(vscode: vscodeTypes.VSCode) {
+    this._vscode = vscode;
     this._clientSocketPromise = new Promise(f => this._clientSocketCallback = f);
   }
 
-  async listen(): Promise<string> {
+  async env() {
+    const wsEndpoint = await this._listen();
+    return {
+      PW_TEST_REPORTER: require.resolve('./oopReporter'),
+      PW_TEST_REPORTER_WS_ENDPOINT: wsEndpoint,
+    };
+  }
+
+  private async _listen(): Promise<string> {
     const server = http.createServer((_, response) => response.end());
     server.on('error', error => console.error(error));
 
@@ -52,8 +66,58 @@ export class DebugServer {
     return wsEndpoint;
   }
 
-  async transport(): Promise<ConnectionTransport> {
-    const socket = await this._clientSocketPromise;
+  private _close() {
+    this._wsServer?.close();
+  }
+
+  async wireTestListener(listener: reporterTypes.ReporterV2, token: vscodeTypes.CancellationToken) {
+    let timeout: NodeJS.Timeout | undefined;
+    const transport = await this._waitForTransport(token);
+    if (transport === 'cancellationRequested')
+      return;
+
+    const killTestProcess = () => {
+      if (!transport.isClosed()) {
+        try {
+          transport.send({ id: 0, method: 'stop', params: {} });
+          timeout = setTimeout(() => transport.close(), 30000);
+        } catch {
+          // Close in case we are getting an error or close is racing back from remote.
+          transport.close();
+        }
+      }
+    };
+
+    token.onCancellationRequested(killTestProcess);
+    if (token.isCancellationRequested)
+      killTestProcess();
+
+    const teleReceiver = new TeleReporterReceiver(listener, {
+      mergeProjects: true,
+      mergeTestCases: true,
+      resolvePath: (rootDir: string, relativePath: string) => path.join(rootDir, relativePath),
+    });
+
+    transport.onmessage = message => {
+      if (token.isCancellationRequested && message.method !== 'onEnd')
+        return;
+      if (message.method === 'onEnd')
+        transport.close();
+      teleReceiver.dispatch(message as any);
+    };
+
+    await new Promise<void>(f => transport.onclose = f);
+    if (timeout)
+      clearTimeout(timeout);
+  }
+
+  private async _waitForTransport(token: vscodeTypes.CancellationToken): Promise<ConnectionTransport | 'cancellationRequested'> {
+    const socket = await Promise.race([
+      this._clientSocketPromise,
+      new Promise<'cancellationRequested'>(f => token.onCancellationRequested(() => { this._close(); f('cancellationRequested'); }))
+    ]);
+    if (socket === 'cancellationRequested')
+      return 'cancellationRequested';
 
     const transport: ConnectionTransport = {
       send: function(message): void {
@@ -84,5 +148,4 @@ export class DebugServer {
     });
     return transport;
   }
-
 }

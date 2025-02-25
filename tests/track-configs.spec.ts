@@ -14,14 +14,11 @@
  * limitations under the License.
  */
 
-import { expect, test } from '@playwright/test';
-import { activate } from './utils';
+import { enableConfigs, expect, test } from './utils';
 
-test.describe.configure({ mode: 'parallel' });
-
-test('should load first config', async ({}, testInfo) => {
-  const { testController, renderExecLog, workspaceFolder } = await activate(testInfo.outputDir, {});
-  expect(testController.renderTestTree()).toBe(`
+test('should load first config', async ({ activate }) => {
+  const { vscode, testController, workspaceFolder } = await activate({});
+  await expect(testController).toHaveTestTree(`
   `);
 
   workspaceFolder.addFile('playwright.config.js', `module.exports = { testDir: 'tests' }`);
@@ -30,28 +27,30 @@ test('should load first config', async ({}, testInfo) => {
     test('one', async () => {});
   `);
 
-  const golden = `
-    - tests
-      - test.spec.ts
-  `;
-  while (testController.renderTestTree() !== golden) await new Promise(f => setTimeout(f, 200));
+  await expect(testController).toHaveTestTree(`
+    -   tests
+      -   test.spec.ts
+  `);
 
-  expect(renderExecLog('  ')).toBe(`
+  await expect(vscode).toHaveExecLog(`
     > playwright list-files -c playwright.config.js
   `);
+  await expect(vscode).toHaveConnectionLog([
+    { method: 'listFiles', params: {} },
+  ]);
 });
 
-test('should load second config', async ({}, testInfo) => {
-  const { testController, renderExecLog, workspaceFolder } = await activate(testInfo.outputDir, {
+test('should load second config', async ({ activate }) => {
+  const { vscode, testController, workspaceFolder } = await activate({
     'playwright1.config.js': `module.exports = { testDir: 'tests1' }`,
     'tests1/test.spec.ts': `
       import { test } from '@playwright/test';
       test('one', async () => {});
     `,
   });
-  expect(testController.renderTestTree()).toBe(`
-    - tests1
-      - test.spec.ts
+  await expect(testController).toHaveTestTree(`
+    -   tests1
+      -   test.spec.ts
   `);
 
   workspaceFolder.addFile('playwright2.config.js', `module.exports = { testDir: 'tests2' }`);
@@ -60,23 +59,28 @@ test('should load second config', async ({}, testInfo) => {
     test('one', async () => {});
   `);
 
-  const golden = `
-    - tests1
-      - test.spec.ts
-    - tests2
-      - test.spec.ts
-  `;
-  while (testController.renderTestTree() !== golden) await new Promise(f => setTimeout(f, 200));
+  await enableConfigs(vscode, ['playwright1.config.js', 'playwright2.config.js']);
+  await expect(testController).toHaveTestTree(`
+    -   tests1
+      -   test.spec.ts
+    -   tests2
+      -   test.spec.ts
+  `);
 
-  expect(renderExecLog('  ')).toBe(`
+  await expect(vscode).toHaveExecLog(`
     > playwright list-files -c playwright1.config.js
     > playwright list-files -c playwright1.config.js
     > playwright list-files -c playwright2.config.js
   `);
+  await expect(vscode).toHaveConnectionLog([
+    { method: 'listFiles', params: {} },
+    { method: 'listFiles', params: {} },
+    { method: 'listFiles', params: {} },
+  ]);
 });
 
-test('should remove model for config', async ({}, testInfo) => {
-  const { testController, renderExecLog, workspaceFolder } = await activate(testInfo.outputDir, {
+test('should remove model for config', async ({ activate }) => {
+  const { vscode, testController, workspaceFolder } = await activate({
     'playwright1.config.js': `module.exports = { testDir: 'tests1' }`,
     'playwright2.config.js': `module.exports = { testDir: 'tests2' }`,
     'tests1/test.spec.ts': `
@@ -88,24 +92,31 @@ test('should remove model for config', async ({}, testInfo) => {
       test('one', async () => {});
     `,
   });
-  expect(testController.renderTestTree()).toBe(`
-    - tests1
-      - test.spec.ts
-    - tests2
-      - test.spec.ts
+
+  await enableConfigs(vscode, ['playwright1.config.js', 'playwright2.config.js']);
+
+  await expect(testController).toHaveTestTree(`
+    -   tests1
+      -   test.spec.ts
+    -   tests2
+      -   test.spec.ts
   `);
 
   workspaceFolder.removeFile('playwright1.config.js');
 
-  const golden = `
-    - tests2
-      - test.spec.ts
-  `;
-  while (testController.renderTestTree() !== golden) await new Promise(f => setTimeout(f, 200));
+  await expect(testController).toHaveTestTree(`
+    -   tests2
+      -   test.spec.ts
+  `);
 
-  expect(renderExecLog('  ')).toBe(`
+  await expect(vscode).toHaveExecLog(`
     > playwright list-files -c playwright1.config.js
     > playwright list-files -c playwright2.config.js
     > playwright list-files -c playwright2.config.js
   `);
+  await expect(vscode).toHaveConnectionLog([
+    { method: 'listFiles', params: {} },
+    { method: 'listFiles', params: {} },
+    { method: 'listFiles', params: {} },
+  ]);
 });

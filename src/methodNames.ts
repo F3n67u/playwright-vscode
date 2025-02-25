@@ -61,3 +61,26 @@ export const pageMethods = [
   'type',
   'uncheck'
 ];
+
+export const locatorMethods = [
+  'locator',
+  'getByAltText',
+  'getByLabel',
+  'getByPlaceholder',
+  'getByRole',
+  'getByTestId',
+  'getByText',
+  'getByTitle',
+  'first',
+  'last',
+  'and',
+  'or',
+  'nth',
+  'filter',
+];
+
+export const locatorMethodRegex = /\.\s*(check|click|fill|type|locator|getBy[\w]+|first|last|nth|filter)\(/;
+
+export function replaceActionWithLocator(expression: string) {
+  return expression.replace(/\.\s*(?:check|click|fill|type)\(([^,]+)(?:,\s*{.*})\)/, '.locator($1)');
+}

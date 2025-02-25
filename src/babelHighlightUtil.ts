@@ -14,13 +14,18 @@
  * limitations under the License.
  */
 
-import { t, parse, ParseResult, traverse, File, SourceLocation } from './babelBundle';
-import { asyncMatchers, pageMethods } from './methodNames';
+import path from 'path';
+import { t, parse, ParseResult, traverse, SourceLocation, babelPresetTypescript, babelPluginProposalDecorators } from './babelBundle';
+import { asyncMatchers, pageMethods, locatorMethods } from './methodNames';
 
-const astCache = new Map<string, { text: string, ast: ParseResult<File> }>();
+const astCache = new Map<string, { text: string, ast?: ParseResult }>();
 
-export function discardBabelAstCache() {
-  astCache.clear();
+export function pruneAstCaches(fsPathsToRetain: string[]) {
+  const retain = new Set(fsPathsToRetain);
+  for (const key of astCache.keys()) {
+    if (!retain.has(key))
+      astCache.delete(key);
+  }
 }
 
 export type SourcePosition = {
@@ -32,9 +37,25 @@ export function locatorForSourcePosition(text: string, vars: { pages: string[], 
   const cached = astCache.get(fsPath);
   let ast = cached?.ast;
   if (!cached || cached.text !== text) {
-    ast = parse(text, { errorRecovery: true, plugins: ['typescript', 'jsx'], sourceType: 'module' });
-    astCache.set(fsPath, { text, ast });
+    try {
+      ast = parse(text, {
+        filename: path.basename(fsPath),
+        plugins: [
+          [babelPluginProposalDecorators, { version: '2023-05' }],
+        ],
+        presets: [[babelPresetTypescript, { onlyRemoveTypeImports: false }]],
+        babelrc: false,
+        configFile: false,
+        sourceType: 'module',
+      });
+      astCache.set(fsPath, { text, ast });
+    } catch (e) {
+      astCache.set(fsPath, { text, ast: undefined });
+    }
   }
+
+  if (!ast)
+    return;
 
   let rangeMatch: string | undefined;
   let lineMatch: string | undefined;
@@ -44,7 +65,7 @@ export function locatorForSourcePosition(text: string, vars: { pages: string[], 
       let pageSelectorNode;
       let pageSelectorCallee;
 
-      // page.*(selector) will highlight `page.locator(selector)`
+      // Hover over page.[click,check,...](selector) will highlight `page.locator(selector)`.
       if (t.isCallExpression(path.node) &&
           t.isMemberExpression(path.node.callee) &&
           t.isIdentifier(path.node.callee.object) &&
@@ -55,13 +76,14 @@ export function locatorForSourcePosition(text: string, vars: { pages: string[], 
         pageSelectorCallee = path.node.callee.object.name;
       }
 
-      // locator.*() will highlight `locator`
+
+      // Hover over locator variables will highlight `locator`.
       if (t.isIdentifier(path.node) &&
           vars.locators.includes(path.node.name))
         expressionNode = path.node;
 
 
-      // Web-first assertions: expect(a).to*
+      // Web assertions: expect(a).to*.
       if (t.isMemberExpression(path.node) &&
           t.isIdentifier(path.node.property) &&
           asyncMatchers.includes(path.node.property.name) &&
@@ -71,11 +93,11 @@ export function locatorForSourcePosition(text: string, vars: { pages: string[], 
         expressionNode = path.node.object.arguments[0];
 
 
-      // *.locator() call
+      // *.locator(), *.getBy*(), *.click(), *.fill(), *.type() call
       if (t.isCallExpression(path.node) &&
           t.isMemberExpression(path.node.callee) &&
           t.isIdentifier(path.node.callee.property) &&
-          path.node.callee.property.name === 'locator')
+          locatorMethods.includes(path.node.callee.property.name))
         expressionNode = path.node;
 
 
@@ -94,7 +116,7 @@ export function locatorForSourcePosition(text: string, vars: { pages: string[], 
           // Prefer shortest range match to better support chains.
           rangeMatch = expression;
         }
-        if (isLineMatch && (!lineMatch || expression.length < lineMatch.length)) {
+        if (isLineMatch && (!lineMatch || lineMatch.length < expression.length)) {
           // Prefer longest line match to better support chains.
           lineMatch = expression;
         }

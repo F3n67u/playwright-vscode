@@ -1,105 +1,222 @@
 {
   "name": "playwright",
   "displayName": "Playwright Test for VSCode",
-  "description": "Run Playwright Test tests in Visual Studio Code.",
+  "description": "%description%",
   "icon": "images/playwright-logo.png",
-  "version": "0.2.3",
-  "preview": true,
+  "version": "1.1.13",
   "publisher": "ms-playwright",
   "repository": "https://github.com/microsoft/playwright-vscode",
   "bugs": {
-    "url": "https://github.com/microsoft/playwright-vscode/issues"
+    "url": "https://github.com/microsoft/playwright/issues"
   },
   "engines": {
-    "vscode": "^1.59.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "Testing"
   ],
   "activationEvents": [
-    "workspaceContains:**/*playwright*.config.{ts,js,mjs}",
-    "onCommand:pw.extension.install",
-    "onCommand:pw.extension.recordTest",
-    "onCommand:pw.extension.refreshTests"
+    "workspaceContains:**/*playwright*.config.{ts,js,mjs}"
   ],
   "main": "./out/extension.js",
+  "l10n": "./l10n",
   "contributes": {
     "commands": [
       {
         "category": "Test",
-        "command": "pw.extension.refreshTests",
-        "icon": "$(refresh)",
-        "title": "Refresh Playwright Tests"
-      },
-      {
-        "category": "Test",
-        "command": "pw.extension.recordTest",
-        "icon": "$(record)",
-        "title": "Record Playwright Test"
-      },
-      {
-        "category": "Test",
         "command": "pw.extension.install",
-        "title": "Install Playwright"
+        "title": "%contributes.command.pw.extension.install%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.installBrowsers",
+        "title": "%contributes.command.pw.extension.installBrowsers%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.command.inspect",
+        "title": "%contributes.command.pw.extension.command.inspect%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.command.closeBrowsers",
+        "title": "%contributes.command.pw.extension.command.closeBrowsers%"
+      },
+      {
+        "category": "Test",
+        "icon": "$(record)",
+        "command": "pw.extension.command.recordNew",
+        "title": "%contributes.command.pw.extension.command.recordNew%"
+      },
+      {
+        "category": "Test",
+        "icon": "$(record)",
+        "command": "pw.extension.command.recordAtCursor",
+        "title": "%contributes.command.pw.extension.command.recordAtCursor%"
+      },
+      {
+        "category": "Test",
+        "icon": "$(gear)",
+        "command": "pw.extension.command.toggleModels",
+        "title": "%contributes.command.pw.extension.command.toggleModels%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.toggle.reuseBrowser",
+        "title": "%contributes.command.pw.extension.toggle.reuseBrowser%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.toggle.showTrace",
+        "title": "%contributes.command.pw.extension.toggle.showTrace%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.toggle.runGlobalSetupOnEachRun",
+        "title": "%contributes.command.pw.extension.toggle.runGlobalSetupOnEachRun%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.command.runGlobalSetup",
+        "title": "%contributes.command.pw.extension.command.runGlobalSetup%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.command.runGlobalTeardown",
+        "title": "%contributes.command.pw.extension.command.runGlobalTeardown%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.command.startDevServer",
+        "title": "%contributes.command.pw.extension.command.startDevServer%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.command.stopDevServer",
+        "title": "%contributes.command.pw.extension.command.stopDevServer%"
+      },
+      {
+        "category": "Test",
+        "command": "pw.extension.command.clearCache",
+        "title": "%contributes.command.pw.extension.command.clearCache%"
       }
     ],
-    "menus": {
-      "view/title": [
-        {
-          "command": "pw.extension.recordTest",
-          "when": "view == workbench.view.testing",
-          "group": "navigation@0"
+    "configuration": {
+      "title": "Playwright",
+      "properties": {
+        "playwright.env": {
+          "type": "object",
+          "default": {},
+          "description": "%configuration.playwright.env%"
         },
+        "playwright.reuseBrowser": {
+          "type": "boolean",
+          "default": false,
+          "description": "%configuration.playwright.reuseBrowser%"
+        },
+        "playwright.showTrace": {
+          "type": "boolean",
+          "default": false,
+          "description": "%configuration.playwright.showTrace%"
+        },
+        "playwright.runGlobalSetupOnEachRun": {
+          "type": "boolean",
+          "default": false,
+          "description": "%configuration.playwright.runGlobalSetupOnEachRun%"
+        },
+        "playwright.updateSnapshots": {
+          "type": "string",
+          "enum": [
+            "all",
+            "changed",
+            "missing",
+            "none"
+          ],
+          "default": "missing",
+          "description": "%configuration.playwright.updateSnapshots%"
+        },
+        "playwright.updateSourceMethod": {
+          "type": "string",
+          "enum": [
+            "overwrite",
+            "patch",
+            "3way"
+          ],
+          "default": "3way",
+          "description": "%configuration.playwright.updateSourceMethod%"
+        }
+      }
+    },
+    "viewsContainers": {
+      "panel": [
         {
-          "command": "pw.extension.refreshTests",
-          "when": "view == workbench.view.testing",
-          "group": "navigation@0"
+          "id": "playwrightContainer",
+          "title": "Playwright",
+          "icon": "images/playwright-logo.png"
+        }
+      ]
+    },
+    "views": {
+      "test": [
+        {
+          "type": "webview",
+          "id": "pw.extension.settingsView",
+          "name": "%views.test.pw.extension.settingsView%"
+        }
+      ],
+      "playwrightContainer": [
+        {
+          "type": "webview",
+          "id": "pw.extension.locatorsView",
+          "name": "%views.test.pw.extension.locatorsView%"
         }
       ]
     }
   },
   "scripts": {
-    "esbuild": "esbuild ./src/babelBundle.ts ./src/extension.ts ./src/oopReporter.ts ./src/debugTransform.ts --bundle --outdir=out --external:vscode --external:./babelBundle --external:./debugTransform --external:./oopReporter --format=cjs --platform=node --target=ES2019",
+    "esbuild": "esbuild ./src/babelBundle.ts ./src/extension.ts ./src/oopReporter.ts ./src/debugTransform.ts ./src/playwrightFinder.ts ./src/*.script.ts --bundle --outdir=out --external:vscode --external:./babelBundle --external:./debugTransform --external:./oopReporter --external:./playwrightFinder --external:./*.script.ts --format=cjs --platform=node --target=ES2019",
     "build": "npm run esbuild -- --minify",
     "watch": "npm run esbuild -- --sourcemap --watch",
-    "vscode:prepublish": "npm run build",
-    "lint": "eslint . --ext .ts,.tsx,.js",
-    "download-api": "vscode-dts dev && vscode-dts main",
+    "l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
+    "lint": "tsc && eslint . --ext .ts,.tsx,.js",
     "test": "playwright test",
-    "package": "vsce package",
-    "code": "code --uninstall-extension ms-playwright.playwright && code --install-extension playwright-0.2.3.vsix",
+    "package": "npm run build && vsce package",
+    "code": "code --uninstall-extension ms-playwright.playwright && code --install-extension playwright-0.2.11.vsix",
     "uncode": "code --uninstall-extension ms-playwright.playwright",
-    "code-insiders": "code-insiders --uninstall-extension ms-playwright.playwright && code-insiders --install-extension playwright-0.2.3.vsix",
+    "code-insiders": "code-insiders --uninstall-extension ms-playwright.playwright && code-insiders --install-extension playwright-0.2.11.vsix",
     "uncode-insiders": "code-insiders --uninstall-extension ms-playwright.playwright"
   },
   "devDependencies": {
-    "@playwright/test": "^1.19.0",
-    "@types/babel__core": "^7.1.18",
-    "@types/babel__helper-plugin-utils": "^7.10.0",
-    "@types/babel__traverse": "^7.14.2",
-    "@types/glob": "^7.2.0",
-    "@types/mocha": "^9.1.0",
-    "@types/node": "^17.0.14",
-    "@types/ws": "^8.2.2",
-    "@typescript-eslint/eslint-plugin": "^5.10.2",
-    "@typescript-eslint/parser": "^5.10.2",
-    "@vscode/test-electron": "^2.1.1",
-    "esbuild": "^0.14.20",
-    "eslint": "^8.8.0",
+    "@babel/preset-typescript": "^7.23.2",
+    "@playwright/test": "1.50.0-beta-1738269400000",
+    "@types/babel__core": "^7.20.3",
+    "@types/babel__helper-plugin-utils": "^7.10.2",
+    "@types/babel__traverse": "^7.20.3",
+    "@types/glob": "^8.0.0",
+    "@types/node": "^18.11.9",
+    "@types/stack-utils": "^2.0.1",
+    "@types/vscode": "1.93.0",
+    "@types/which": "^3.0.3",
+    "@types/ws": "^8.5.3",
+    "@typescript-eslint/eslint-plugin": "^7.3.1",
+    "@typescript-eslint/parser": "^7.3.1",
+    "@vscode/l10n-dev": "^0.0.24",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "eslint": "^8.57.0",
     "eslint-plugin-notice": "^0.9.10",
-    "eslint-plugin-react-hooks": "^4.3.0",
-    "glob": "^7.2.0",
-    "mocha": "^9.2.0",
-    "typescript": "^4.5.5",
-    "vsce": "^2.6.7",
-    "vscode-dts": "^0.3.3"
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "glob": "^8.0.3",
+    "minimatch": "^10.0.1",
+    "typescript": "^5.4.3"
   },
   "dependencies": {
-    "@babel/core": "^7.16.12",
-    "@babel/helper-plugin-utils": "^7.16.7",
-    "@babel/parser": "^7.16.12",
-    "@babel/traverse": "^7.16.10",
-    "stack-utils": "^2.0.5",
-    "ws": "^8.4.2"
+    "@babel/core": "^7.23.2",
+    "@babel/helper-plugin-utils": "^7.22.5",
+    "@babel/plugin-proposal-decorators": "^7.24.7",
+    "@babel/traverse": "^7.23.2",
+    "stack-utils": "^2.0.6",
+    "which": "^4.0.0",
+    "ws": "^8.17.1"
   }
 }

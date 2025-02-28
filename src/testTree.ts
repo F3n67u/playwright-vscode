@@ -15,56 +15,57 @@
  */
 
 import path from 'path';
-import { Entry, EntryType } from './oopReporter';
-import { Location } from './reporter';
-import { TestModel } from './testModel';
-import { createGuid } from './utils';
+import { TestModelCollection } from './testModel';
+import type { TestProject } from './testModel';
+import { createGuid, normalizePath, uriToPath } from './utils';
 import * as vscodeTypes from './vscodeTypes';
+import * as reporterTypes from './upstream/reporter';
+import * as upstream from './upstream/testTree';
+import { TeleSuite } from './upstream/teleReceiver';
+import { DisposableBase } from './disposableBase';
 
-export class TestTree {
+/**
+ * This class maps a collection of TestModels into the UI terms, it merges
+ * multiple logical entities (for example, one per project) into a single UI entity
+ * that can be executed at once.
+ */
+export class TestTree extends DisposableBase {
   private _vscode: vscodeTypes.VSCode;
 
   // We don't want tests to persist state between sessions, so we are using unique test id prefixes.
   private _testGeneration = '';
 
   // Global test item map location => fileItem that are files.
-  private _folderItems = new Map<string, vscodeTypes.TestItem>();
-  private _fileItems = new Map<string, vscodeTypes.TestItem>();
+  private _rootItems = new Map<string, vscodeTypes.TestItem>();
 
   private _testController: vscodeTypes.TestController;
-  private _models: TestModel[] = [];
-  private _disposables: vscodeTypes.Disposable[] = [];
+  private _models: TestModelCollection;
   private _loadingItem: vscodeTypes.TestItem;
+  private _testItemByTestId = new Map<string, vscodeTypes.TestItem>();
+  private _testItemByFile = new Map<string, vscodeTypes.TestItem>();
 
-  constructor(vscode: vscodeTypes.VSCode, testController: vscodeTypes.TestController) {
+  constructor(vscode: vscodeTypes.VSCode, models: TestModelCollection, testController: vscodeTypes.TestController) {
+    super();
     this._vscode = vscode;
+    this._models = models;
     this._testController = testController;
     this._loadingItem = this._testController.createTestItem('loading', 'Loading\u2026');
+    this._disposables = [
+      models.onUpdated(() => this._update()),
+    ];
   }
 
   startedLoading() {
-    this._disposables.forEach(d => d.dispose());
-    this._disposables = [];
-    this._models = [];
     this._testGeneration = createGuid() + ':';
-    this._fileItems.clear();
-    this._folderItems.clear();
     this._testController.items.replace([]);
+    this._rootItems.clear();
+    this._testItemByTestId.clear();
+    this._testItemByFile.clear();
 
     if (!this._vscode.workspace.workspaceFolders?.length)
       return;
 
-    if (this._vscode.workspace.workspaceFolders?.length === 1) {
-      const rootItem = this._createInlineRootItem(this._vscode.workspace.workspaceFolders[0].uri);
-      rootItem.children.replace([this._loadingItem]);
-    } else {
-      const rootTreeItems = [];
-      for (const workspaceFolder of this._vscode.workspace.workspaceFolders || []) {
-        const rootTreeItem = this._createRootFolderItem(workspaceFolder.uri.fsPath);
-        rootTreeItems.push(rootTreeItem);
-      }
-      this._testController.items.replace([this._loadingItem, ...rootTreeItems]);
-    }
+    this._testController.items.replace([this._loadingItem]);
   }
 
   finishedLoading() {
@@ -74,16 +75,13 @@ export class TestTree {
       this._testController.items.delete(this._loadingItem.id);
   }
 
-  addModel(model: TestModel) {
-    this._models.push(model);
-    this._disposables.push(model.onUpdated(() => this._update()));
-  }
-
   collectTestsInside(rootItem: vscodeTypes.TestItem): vscodeTypes.TestItem[] {
     const result: vscodeTypes.TestItem[] = [];
     const visitItem = (testItem: vscodeTypes.TestItem) => {
-      const entryType = (testItem as any)[itemTypeSymbol] as EntryType;
-      if (entryType === 'test')
+      const treeItem = (testItem as any)[testTreeItemSymbol] as upstream.TreeItem | undefined;
+      if (!testItem)
+        return;
+      if ((treeItem?.kind === 'case' || treeItem?.kind === 'test') && treeItem.test)
         result.push(testItem);
       else
         testItem.children.forEach(visitItem);
@@ -93,150 +91,200 @@ export class TestTree {
   }
 
   private _update() {
-    const allFiles = new Set<string>();
-    for (const model of this._models)
-      model.allFiles.forEach(f => allFiles.add(f));
+    for (const workspaceFolder of this._vscode.workspace.workspaceFolders ?? []) {
+      const disabledProjects: TestProject[] = [];
+      const workspaceFSPath = uriToPath(workspaceFolder.uri);
+      const rootSuite = new TeleSuite('', 'root');
+      for (const model of this._models.enabledModels().filter(m => m.config.workspaceFolder === workspaceFSPath)) {
+        for (const project of model.projects()) {
+          if (project.isEnabled)
+            rootSuite.suites.push(project.suite as TeleSuite);
+          else
+            disabledProjects.push(project);
+        }
+      }
 
-    for (const file of allFiles) {
-      if (!this._belongsToWorkspace(file))
+      const upstreamTree = new upstream.TestTree(workspaceFSPath, rootSuite, [], undefined, path.sep);
+      upstreamTree.sortAndPropagateStatus();
+      upstreamTree.flattenForSingleProject();
+
+      if (upstreamTree.rootItem.children.length === 0 && !disabledProjects.length) {
+        this._deleteRootItem(workspaceFSPath);
         continue;
-      const fileItem = this.getOrCreateFileItem(file);
-      const signature: string[] = [];
-      let entries: Entry[] | undefined;
-      for (const model of this._models) {
-        for (const testProject of model.projects.values()) {
-          const testFile = testProject.files.get(file);
-          if (!testFile || !testFile.entries())
-            continue;
-          signature.push(testProject.testDir + ':' + testProject.name + ':' + testFile.revision());
-          entries = entries || [];
-          if (testFile.entries())
-            entries.push(...testFile.entries()!);
-        }
       }
-      if (entries) {
-        const signatureText = signature.join('|');
-        if ((fileItem as any)[signatureSymbol] !== signatureText) {
-          (fileItem as any)[signatureSymbol] = signatureText;
-          this._updateTestItems(fileItem.children, entries);
-        }
+
+      const workspaceRootItem = this._createRootItemIfNeeded(workspaceFolder.uri);
+      this._syncSuite(upstreamTree.rootItem, workspaceRootItem);
+      this._syncDisabledProjects(workspaceRootItem, disabledProjects);
+    }
+
+    // Remove stale root items.
+    for (const itemFsPath of this._rootItems.keys()) {
+      if (!this._vscode.workspace.workspaceFolders!.find(f => uriToPath(f.uri) === itemFsPath))
+        this._deleteRootItem(itemFsPath);
+    }
+    this._indexTree();
+  }
+
+  private _syncSuite(uItem: upstream.TreeItem, vsItem: vscodeTypes.TestItem) {
+    const uChildren = uItem.children;
+    const vsChildren = vsItem.children;
+    const uChildrenById = new Map(uChildren.map(c => [c.id, c]));
+    const vsChildrenById = new Map<string, vscodeTypes.TestItem>();
+    vsChildren.forEach(c => {
+      if (c.id.startsWith(this._testGeneration))
+        vsChildrenById.set(c.id.substring(this._testGeneration.length), c);
+    });
+
+    // Remove deleted children.
+    for (const id of vsChildrenById.keys()) {
+      if (!uChildrenById.has(id)) {
+        vsChildren.delete(this._idWithGeneration(id));
+        vsChildrenById.delete(id);
       }
     }
 
-    for (const [location, fileItem] of this._fileItems) {
-      if (!allFiles.has(location)) {
-        this._fileItems.delete(location);
-        fileItem.parent?.children.delete(fileItem.id);
+    // Add new children.
+    for (const [id, uChild] of uChildrenById) {
+      let vsChild = vsChildrenById.get(id);
+      if (!vsChild) {
+        vsChild = this._testController.createTestItem(this._idWithGeneration(id), uChild.title, this._vscode.Uri.file(uChild.location.file));
+        // Allow lazy-populating file items created via listFiles.
+        if (uChild.kind === 'group' && uChild.subKind === 'file' && !uChild.children.length)
+          vsChild.canResolveChildren = true;
+        vsChildrenById.set(id, vsChild);
+        vsChildren.add(vsChild);
       }
+      (vsChild as any)[testTreeItemSymbol] = uChild;
+      if (uChild.kind === 'case' && !areEqualTags(uChild.tags, vsChild.tags))
+        vsChild.tags = uChild.tags.map(tag => new this._vscode.TestTag(tag));
+      const hasLocation = uChild.location.line || uChild.location.column;
+      if (hasLocation && (!vsChild.range || vsChild.range.start.line + 1 !== uChild.location.line)) {
+        const line = uChild.location.line;
+        vsChild.range = new this._vscode.Range(Math.max(line - 1, 0), 0, line, 0);
+      } else if (hasLocation && !vsChild.range) {
+        vsChild.range = undefined;
+      }
+    }
+
+    // Sync children.
+    for (const [id, uChild] of uChildrenById) {
+      const vsChild = vsChildrenById.get(id);
+      this._syncSuite(uChild, vsChild!);
     }
   }
 
-  private _belongsToWorkspace(file: string) {
-    for (const workspaceFolder of this._vscode.workspace.workspaceFolders || []) {
-      if (file.startsWith(workspaceFolder.uri.fsPath))
-        return true;
+  private _syncDisabledProjects(workspaceRootItem: vscodeTypes.TestItem, disabledProjects: TestProject[]) {
+    const topLevelItems: string[] = [];
+    workspaceRootItem.children.forEach(item => topLevelItems.push(item.id));
+    const oldDisabledProjectIds = new Set(topLevelItems.filter(item => item.startsWith('[disabled] ')));
+    const sortedProject = disabledProjects.sort((a, b) => {
+      const keyA = a.model.config.configFile + ':' + a.name;
+      const keyB = b.model.config.configFile + ':' + b.name;
+      return keyA.localeCompare(keyB);
+    });
+    for (const project of sortedProject) {
+      const config = project.model.config;
+      const projectId = '[disabled] ' + project.name + ' - ' + config.configFile;
+      if (oldDisabledProjectIds.has(projectId)) {
+        oldDisabledProjectIds.delete(projectId);
+        continue;
+      }
+
+      const item = this._testController.createTestItem(projectId, '');
+      item.description = `${path.relative(config.workspaceFolder, normalizePath(config.configFile))} [${project.name}] — disabled`;
+      item.sortText = 'z' + project.name;
+      (item as any)[disabledProjectSymbol] = project;
+      workspaceRootItem.children.add(item);
     }
-    return false;
+    for (const projectId of oldDisabledProjectIds)
+      workspaceRootItem.children.delete(projectId);
   }
 
-  private _updateTestItems(collection: vscodeTypes.TestItemCollection, entries: Entry[]) {
-    const existingItems = new Map<string, vscodeTypes.TestItem>();
-    collection.forEach(test => existingItems.set(test.label, test));
-    const itemsToDelete = new Map<string, vscodeTypes.TestItem>(existingItems);
-
-    for (const entry of entries) {
-      let testItem = existingItems.get(entry.title);
-      if (!testItem) {
-        // We sort by id in tests, so start with location.
-        testItem = this._testController.createTestItem(this._id(entry.location.file + ':' + entry.location.line + '|' + entry.title), entry.title, this._vscode.Uri.file(entry.location.file));
-        (testItem as any)[itemTypeSymbol] = entry.type;
-        collection.add(testItem);
-      }
-      if (!testItem.range || testItem.range.start.line + 1 !== entry.location.line) {
-        const line = entry.location.line;
-        testItem.range = new this._vscode.Range(line - 1, 0, line, 0);
-      }
-      this._updateTestItems(testItem.children, entry.children || []);
-      itemsToDelete.delete(entry.title);
-    }
-
-    for (const testItem of itemsToDelete.values())
-      collection.delete(testItem.id);
-  }
-
-  private _createInlineRootItem(uri: vscodeTypes.Uri): vscodeTypes.TestItem {
-    const testItem: vscodeTypes.TestItem = {
-      id: this._id(uri.fsPath),
-      uri: uri,
-      children: this._testController.items,
-      parent: undefined,
-      tags: [],
-      canResolveChildren: false,
-      busy: false,
-      label: '<root>',
-      range: undefined,
-      error: undefined,
+  private _indexTree() {
+    this._testItemByTestId.clear();
+    this._testItemByFile.clear();
+    const visit = (item: vscodeTypes.TestItem) => {
+      const treeItem = (item as any)[testTreeItemSymbol] as upstream.TreeItem | undefined;
+      if ((treeItem?.kind === 'case' || treeItem?.kind === 'test') && treeItem.test)
+        this._testItemByTestId.set(treeItem.test.id, item);
+      for (const [, child] of item.children)
+        visit(child);
+      if (item.uri && !item.range)
+        this._testItemByFile.set(uriToPath(item.uri), item);
     };
-    this._folderItems.set(uri.fsPath, testItem);
-    return testItem;
+    for (const item of this._rootItems.values())
+      visit(item);
   }
 
-  private _createRootFolderItem(folder: string): vscodeTypes.TestItem {
-    const folderItem = this._testController.createTestItem(this._id(folder), path.basename(folder), this._vscode.Uri.file(folder));
-    this._folderItems.set(folder, folderItem);
-    return folderItem;
+  private _createRootItemIfNeeded(uri: vscodeTypes.Uri): vscodeTypes.TestItem {
+    const fsPath = uriToPath(uri);
+    if (this._rootItems.has(fsPath))
+      return this._rootItems.get(fsPath)!;
+    let item: vscodeTypes.TestItem;
+    if (this._vscode.workspace.workspaceFolders!.length === 1) {
+      item = {
+        id: this._idWithGeneration(fsPath),
+        uri: uri,
+        children: this._testController.items,
+        parent: undefined,
+        tags: [],
+        canResolveChildren: false,
+        busy: false,
+        label: '<root>',
+        range: undefined,
+        error: undefined,
+      };
+    } else {
+      item = this._testController.createTestItem(this._idWithGeneration(fsPath), path.basename(fsPath), uri);
+      this._testController.items.add(item);
+    }
+    this._rootItems.set(fsPath, item);
+    return item;
   }
 
-  testItemForLocation(location: Location, title: string): vscodeTypes.TestItem | undefined {
-    const fileItem = this._fileItems.get(location.file);
-    if (!fileItem)
-      return;
-    let result: vscodeTypes.TestItem | undefined;
-    const visitItem = (testItem: vscodeTypes.TestItem) => {
-      if (result)
-        return;
-      if (testItem.label === title && testItem.range?.start.line === location.line - 1) {
-        result = testItem;
-        return;
-      }
-      testItem.children.forEach(visitItem);
-    };
-    fileItem.children.forEach(visitItem);
-    return result || fileItem;
+  private _deleteRootItem(fsPath: string): void {
+    if (this._vscode.workspace.workspaceFolders!.length === 1) {
+      const items: vscodeTypes.TestItem[] = [];
+      this._testController.items.forEach(item => items.push(item));
+      this._testController.items.replace(items.filter(i => i.id === 'loading' || i.id === 'disabled'));
+    } else {
+      this._testController.items.delete(this._idWithGeneration(fsPath));
+    }
+    this._rootItems.delete(fsPath);
   }
 
-  getOrCreateFileItem(file: string): vscodeTypes.TestItem {
-    const result = this._fileItems.get(file);
-    if (result)
-      return result;
-
-    const parentFile = path.dirname(file);
-    const parentItem = this.getOrCreateFolderItem(parentFile);
-    const fileItem = this._testController.createTestItem(this._id(file), path.basename(file), this._vscode.Uri.file(file));
-    fileItem.canResolveChildren = true;
-    this._fileItems.set(file, fileItem);
-
-    parentItem.children.add(fileItem);
-    return fileItem;
+  testItemForTest(test: reporterTypes.TestCase): vscodeTypes.TestItem | undefined {
+    return this._testItemByTestId.get(test.id);
   }
 
-  getOrCreateFolderItem(folder: string): vscodeTypes.TestItem {
-    const result = this._folderItems.get(folder);
-    if (result)
-      return result;
-
-    const parentFolder = path.dirname(folder);
-    const parentItem = this.getOrCreateFolderItem(parentFolder);
-    const folderItem = this._testController.createTestItem(this._id(folder), path.basename(folder), this._vscode.Uri.file(folder));
-    this._folderItems.set(folder, folderItem);
-    parentItem.children.add(folderItem);
-    return folderItem;
+  testItemForFile(file: string): vscodeTypes.TestItem | undefined {
+    return this._testItemByFile.get(file);
   }
 
-  private _id(location: string): string {
-    return this._testGeneration + location;
+  private _idWithGeneration(id: string): string {
+    return this._testGeneration + id;
   }
 }
 
-const signatureSymbol = Symbol('signatureSymbol');
-const itemTypeSymbol = Symbol('itemTypeSymbol');
+function areEqualTags(uTags: readonly string[], vsTags: readonly vscodeTypes.TestTag[]): boolean {
+  if (uTags.length !== vsTags.length)
+    return false;
+  const uTagsSet = new Set(uTags);
+  for (const tag of vsTags) {
+    if (!uTagsSet.has(tag.id))
+      return false;
+  }
+  return true;
+}
+
+export function upstreamTreeItem(treeItem: vscodeTypes.TreeItem): upstream.TreeItem {
+  return (treeItem as any)[testTreeItemSymbol] as upstream.TreeItem;
+}
+
+export function disabledProjectName(item: vscodeTypes.TestItem): TestProject | undefined {
+  return (item as any)[disabledProjectSymbol];
+}
+
+const testTreeItemSymbol = Symbol('testTreeItemSymbol');
+const disabledProjectSymbol = Symbol('disabledProjectSymbol');

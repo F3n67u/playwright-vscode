@@ -13,12 +13,56 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import { PlaywrightTestConfig } from '@playwright/test';
+import { defineConfig } from '@playwright/test';
+import { WorkerOptions } from './tests/utils';
 
-const config: PlaywrightTestConfig = {
+export default defineConfig<WorkerOptions>({
   testDir: './tests',
+  outputDir: './test-results/inner',
+  fullyParallel: true,
   forbidOnly: !!process.env.CI,
   workers: process.env.CI ? 1 : undefined,
-  reporter: 'line',
-};
-export default config;
+  reporter: process.env.CI ? [
+    ['line'],
+    ['blob'],
+  ] : [
+    ['line']
+  ],
+  projects: [
+    {
+      name: 'default',
+    },
+    {
+      name: 'default-reuse',
+      use: {
+        showBrowser: true,
+      }
+    },
+    {
+      name: 'default-trace',
+      use: {
+        showTrace: true,
+      }
+    },
+    {
+      name: 'legacy',
+      use: {
+        overridePlaywrightVersion: 1.43,
+      }
+    },
+    {
+      name: 'legacy-reuse',
+      use: {
+        overridePlaywrightVersion: 1.43,
+        showBrowser: true,
+      }
+    },
+    {
+      name: 'legacy-trace',
+      use: {
+        overridePlaywrightVersion: 1.43,
+        showTrace: true,
+      }
+    },
+  ]
+});

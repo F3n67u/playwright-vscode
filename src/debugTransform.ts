@@ -29,7 +29,7 @@ export default declare(api => {
         if (!isAwaitExpression && !isCallExpression)
           return;
         // Prevent re-enterability without calling path.skip.
-        if (t.isBlockStatement(path.parentPath) && t.isTryStatement(path.parentPath.parentPath))
+        if (path.parentPath.isBlockStatement() && path.parentPath.parentPath.isTryStatement())
           return;
         if (isAwaitExpression && !t.isCallExpression(expression.argument))
           return;
@@ -38,10 +38,10 @@ export default declare(api => {
               path.node
             ]),
             t.catchClause(
-                t.identifier('playwrightError'),
+                t.identifier('__playwright_error__'),
                 t.blockStatement([
                   t.debuggerStatement(),
-                  t.throwStatement(t.identifier('playwrightError'))
+                  t.throwStatement(t.identifier('__playwright_error__'))
                 ])
             )
         ));
